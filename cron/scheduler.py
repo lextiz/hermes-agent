@@ -1341,6 +1341,144 @@ def _scan_assembled_cron_prompt(assembled: str, job: dict, *, has_skills: bool =
     return assembled
 
 
+def _cron_session_title(job: dict, run_started_at) -> str:
+    """Build a unique, compact title for cron sessions shown in the UI."""
+    stamp = run_started_at.strftime("%Y-%m-%d %H:%M:%S")
+    prefix = "Cron: "
+    suffix = f" @ {stamp}"
+    job_name = str(job.get("name") or job.get("id") or "cron job").strip() or "cron job"
+    max_name_len = max(1, 100 - len(prefix) - len(suffix))
+    if len(job_name) > max_name_len:
+        if max_name_len > 3:
+            job_name = job_name[: max_name_len - 3].rstrip() + "..."
+        else:
+            job_name = job_name[:max_name_len]
+    return f"{prefix}{job_name}{suffix}"
+
+
+def _set_cron_session_title(session_db, session_id: str, job: dict, run_started_at) -> None:
+    """Best-effort title assignment for cron sessions."""
+    title = _cron_session_title(job, run_started_at)
+    try:
+        session_db.set_session_title(session_id, title)
+    except Exception as exc:
+        suffix = f" #{session_id[-6:]}"
+        fallback = title
+        if len(fallback) + len(suffix) > 100:
+            fallback = fallback[: 100 - len(suffix)].rstrip()
+        try:
+            session_db.set_session_title(session_id, f"{fallback}{suffix}")
+        except Exception:
+            logger.debug("Job '%s': failed to set cron session title: %s", job.get("id", "?"), exc)
+
+
+def _set_cron_session_tree_titles(session_db, root_session_id: str, job: dict) -> None:
+    """Apply cron titles to compression/continuation sessions under a run."""
+    try:
+        from datetime import datetime
+
+        with session_db._lock:
+            rows = session_db._conn.execute(
+                """
+                WITH RECURSIVE session_tree(id, started_at) AS (
+                    SELECT id, started_at FROM sessions WHERE id = ?
+                    UNION ALL
+                    SELECT s.id, s.started_at
+                    FROM sessions s
+                    JOIN session_tree parent ON s.parent_session_id = parent.id
+                )
+                SELECT id, started_at FROM session_tree
+                """,
+                (root_session_id,),
+            ).fetchall()
+        for row in rows:
+            started_at = row["started_at"] if isinstance(row, dict) else row["started_at"]
+            _set_cron_session_title(
+                session_db,
+                row["id"],
+                job,
+                datetime.fromtimestamp(float(started_at)),
+            )
+    except Exception as exc:
+        logger.debug("Job '%s': failed to title cron session tree: %s", job.get("id", "?"), exc)
+
+
+def _close_cron_session_db(session_db, job_id: str) -> None:
+    """Close a SessionDB opened by a pre-agent cron path."""
+    if not session_db:
+        return
+    try:
+        session_db.close()
+    except Exception as exc:
+        logger.debug("Job '%s': failed to close SQLite session store: %s", job_id, exc)
+
+
+def _persist_cron_output_session(
+    job: dict,
+    session_id: str,
+    output: str,
+    final_response: str,
+    success: bool,
+    error: Optional[str],
+    run_started_at,
+    *,
+    model: Optional[str] = None,
+    session_db=None,
+) -> None:
+    """Persist non-agent cron output as a normal session for UI visibility.
+
+    LLM-backed cron jobs already write their conversation through AIAgent. This
+    helper is for script-only jobs and pre-agent failures where no conversation
+    exists yet, and it deliberately skips silent runs to avoid flooding Sessions.
+    """
+    final_text = (final_response or "").strip()
+    if success and final_text.upper() == SILENT_MARKER:
+        return
+
+    content = (output or final_response or error or "").strip()
+    if not content:
+        return
+
+    db = session_db
+    close_db = False
+    try:
+        if db is None:
+            from hermes_state import SessionDB
+            db = SessionDB()
+            close_db = True
+
+        db.ensure_session(session_id, source="cron", model=model)
+        _set_cron_session_title(db, session_id, job, run_started_at)
+
+        try:
+            has_messages = bool(db.get_messages(session_id))
+        except Exception:
+            has_messages = False
+
+        if not has_messages:
+            user_lines = [
+                f"Cron job: {job.get('name') or job.get('id')}",
+                f"Job ID: {job.get('id', '')}",
+                f"Schedule: {job.get('schedule_display', 'N/A')}",
+            ]
+            if job.get("no_agent"):
+                user_lines.append("Mode: no_agent script")
+            if job.get("script"):
+                user_lines.append(f"Script: {job.get('script')}")
+            db.append_message(session_id, "user", "\n".join(user_lines))
+            db.append_message(session_id, "assistant", content)
+
+        db.end_session(session_id, "cron_complete" if success else "cron_failed")
+    except Exception as exc:
+        logger.debug("Job '%s': failed to persist cron output session: %s", job.get("id", "?"), exc)
+    finally:
+        if close_db and db is not None:
+            try:
+                db.close()
+            except Exception:
+                pass
+
+
 def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
     """Execute a single cron job, applying any per-job profile override."""
     job_id = job["id"]
@@ -1357,6 +1495,8 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
     """
     job_id = job["id"]
     job_name = str(job.get("name") or job.get("prompt") or job_id or "cron job")
+    _run_started_at = _hermes_now()
+    _cron_session_id = f"cron_{job_id}_{_run_started_at.strftime('%Y%m%d_%H%M%S')}"
 
     # ---------------------------------------------------------------
     # no_agent short-circuit — the script IS the job, no LLM involvement.
@@ -1377,11 +1517,32 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
     #                               the whole point of no_agent is that there
     #                               is no agent to wake
     if job.get("no_agent"):
+        def _finish_no_agent(success: bool, doc: str, final_response: str, error: Optional[str]):
+            _persist_cron_output_session(
+                job,
+                _cron_session_id,
+                doc,
+                final_response,
+                success,
+                error,
+                _run_started_at,
+                model="no-agent",
+            )
+            return success, doc, final_response, error
+
         script_path = job.get("script")
         if not script_path:
             err = "no_agent=True but no script is set for this job"
             logger.error("Job '%s': %s", job_id, err)
-            return False, "", "", err
+            doc = (
+                f"# Cron Job: {job_name}\n\n"
+                f"**Job ID:** {job_id}\n"
+                f"**Run Time:** {_run_started_at.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                f"**Mode:** no_agent (script)\n"
+                f"**Status:** configuration error\n\n"
+                f"{err}\n"
+            )
+            return _finish_no_agent(False, doc, "", err)
 
         # Apply workdir if configured — lets scripts use predictable relative
         # paths. For no_agent jobs this is just the subprocess cwd (not an
@@ -1404,7 +1565,7 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
                 except OSError:
                     pass
 
-        now_iso = _hermes_now().strftime("%Y-%m-%d %H:%M:%S")
+        now_iso = _run_started_at.strftime("%Y-%m-%d %H:%M:%S")
 
         if not ok:
             # Script crashed / timed out / exited non-zero.  Deliver the
@@ -1423,7 +1584,7 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
                 f"**Status:** script failed\n\n"
                 f"{output}\n"
             )
-            return False, doc, alert, output
+            return _finish_no_agent(False, doc, alert, output)
 
         # Honour the wakeAgent gate as a silent signal — `wakeAgent: false`
         # means "nothing to report this tick", same as empty stdout.
@@ -1438,7 +1599,7 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
                 f"**Mode:** no_agent (script)\n"
                 f"**Status:** silent (wakeAgent=false)\n"
             )
-            return True, silent_doc, SILENT_MARKER, None
+            return _finish_no_agent(True, silent_doc, SILENT_MARKER, None)
 
         if not output.strip():
             logger.info("Job '%s' (no_agent): empty stdout — silent run", job_id)
@@ -1449,7 +1610,7 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
                 f"**Mode:** no_agent (script)\n"
                 f"**Status:** silent (empty output)\n"
             )
-            return True, silent_doc, SILENT_MARKER, None
+            return _finish_no_agent(True, silent_doc, SILENT_MARKER, None)
 
         doc = (
             f"# Cron Job: {job_name}\n\n"
@@ -1459,7 +1620,7 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
             f"---\n\n"
             f"{output}\n"
         )
-        return True, doc, output, None
+        return _finish_no_agent(True, doc, output, None)
 
     # ---------------------------------------------------------------
     # Default (LLM) path — import and construct the agent machinery now
@@ -1498,6 +1659,7 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
                 f"**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
                 "Script gate returned `wakeAgent=false` — agent skipped.\n"
             )
+            _close_cron_session_db(_session_db, job_id)
             return True, silent_doc, SILENT_MARKER, None
 
     try:
@@ -1514,7 +1676,7 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
         blocked_doc = (
             f"# Cron Job: {job_name}\n\n"
             f"**Job ID:** {job_id}\n"
-            f"**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"**Run Time:** {_run_started_at.strftime('%Y-%m-%d %H:%M:%S')}\n"
             f"**Status:** BLOCKED\n\n"
             "The assembled prompt (user prompt + loaded skill content) tripped "
             "the cron injection scanner and the agent was NOT run.\n\n"
@@ -1524,12 +1686,23 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
             "and the match is a false positive, rephrase the content to avoid "
             "the threat pattern (`tools/cronjob_tools.py::_CRON_THREAT_PATTERNS`)."
         )
+        _persist_cron_output_session(
+            job,
+            _cron_session_id,
+            blocked_doc,
+            "",
+            False,
+            str(block_exc),
+            _run_started_at,
+            session_db=_session_db,
+        )
+        _close_cron_session_db(_session_db, job_id)
         return False, blocked_doc, "", str(block_exc)
     if prompt is None:
         logger.info("Job '%s': script produced no output, skipping AI call.", job_name)
+        _close_cron_session_db(_session_db, job_id)
         return True, "", SILENT_MARKER, None
     origin = _resolve_origin(job)
-    _cron_session_id = f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}"
 
     logger.info("Running job '%s' (ID: %s)", job_name, job_id)
     logger.info("Prompt: %s", prompt[:100])
@@ -1748,6 +1921,13 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
             except Exception as e:
                 logger.debug("Job '%s': failed to load credential pool for %s: %s", job_id, runtime_provider, e)
 
+        if _session_db:
+            try:
+                _session_db.ensure_session(_cron_session_id, source="cron", model=model)
+                _set_cron_session_title(_session_db, _cron_session_id, job, _run_started_at)
+            except Exception as e:
+                logger.debug("Job '%s': failed to initialize cron session metadata: %s", job_id, e)
+
         # Initialize MCP servers so configured mcp_servers are available to
         # the agent's tool registry before AIAgent is constructed. Without
         # this, cron jobs never saw any MCP tools — only the gateway / CLI
@@ -1944,7 +2124,7 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
         output = f"""# Cron Job: {job_name} (FAILED)
 
 **Job ID:** {job_id}
-**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}
+**Run Time:** {_run_started_at.strftime('%Y-%m-%d %H:%M:%S')}
 **Schedule:** {job.get('schedule_display', 'N/A')}
 
 ## Prompt
@@ -1957,6 +2137,16 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
 {error_msg}
 ```
 """
+        _persist_cron_output_session(
+            job,
+            _cron_session_id,
+            output,
+            "",
+            False,
+            error_msg,
+            _run_started_at,
+            session_db=_session_db,
+        )
         return False, output, "", error_msg
 
     finally:
@@ -1986,6 +2176,7 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
             except (Exception, KeyboardInterrupt) as e:
                 logger.debug("Job '%s': failed to set cron session title: %s", job_id, e)
             try:
+                _set_cron_session_tree_titles(_session_db, _cron_session_id, job)
                 _session_db.end_session(_cron_session_id, "cron_complete")
             except (Exception, KeyboardInterrupt) as e:
                 logger.debug("Job '%s': failed to end session: %s", job_id, e)
