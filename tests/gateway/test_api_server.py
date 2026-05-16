@@ -1394,6 +1394,47 @@ class TestChatCompletionsEndpoint:
             assert call_kwargs["conversation_history"][1] == {"role": "assistant", "content": "2"}
 
     @pytest.mark.asyncio
+    async def test_body_session_id_loads_state_db_history_on_loopback(self, adapter):
+        """Desktop/OpenAI clients can continue a stored cron session via body session_id."""
+        session_id = "cron_597928086a82_20260516_185301"
+        saved_history = [
+            {"role": "user", "content": "Run the contribution status brief."},
+            {"role": "assistant", "content": "Proposed Next Actions (Requires Approval)."},
+        ]
+        mock_result = {"final_response": "approved", "messages": [], "api_calls": 1}
+        mock_db = MagicMock()
+        mock_db.get_messages_as_conversation.return_value = saved_history
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with (
+                patch.object(adapter, "_ensure_session_db", return_value=mock_db),
+                patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run,
+            ):
+                mock_run.return_value = (
+                    mock_result,
+                    {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+                )
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "hermes-agent",
+                        "session_id": session_id,
+                        "messages": [{"role": "user", "content": "/approve"}],
+                    },
+                )
+
+        assert resp.status == 200
+        mock_db.get_messages_as_conversation.assert_called_once_with(
+            session_id,
+            include_ancestors=True,
+        )
+        call_kwargs = mock_run.call_args.kwargs
+        assert call_kwargs["session_id"] == session_id
+        assert call_kwargs["conversation_history"] == saved_history
+        assert call_kwargs["user_message"] == "/approve"
+
+    @pytest.mark.asyncio
     async def test_agent_error_returns_500(self, adapter):
         """Agent exception returns 500."""
         app = _create_app(adapter)

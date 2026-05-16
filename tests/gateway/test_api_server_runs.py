@@ -256,6 +256,49 @@ class TestRunStatus:
                 assert status["session_id"] == "space-session"
 
     @pytest.mark.asyncio
+    async def test_start_with_session_id_loads_state_db_history(self, adapter):
+        app = _create_runs_app(adapter)
+        saved_history = [
+            {"role": "user", "content": "Cron job: contribution status"},
+            {"role": "assistant", "content": "Proposed Next Actions (Requires Approval): rebase all branches"},
+        ]
+        fake_db = MagicMock()
+        fake_db.get_messages_as_conversation.return_value = saved_history
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create, \
+                 patch.object(adapter, "_ensure_session_db", return_value=fake_db):
+                mock_agent = MagicMock()
+                mock_agent.run_conversation.return_value = {"final_response": "continuing"}
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_create.return_value = mock_agent
+
+                resp = await cli.post(
+                    "/v1/runs",
+                    json={"input": "/approve", "session_id": "cron_597928086a82_20260516_185301"},
+                )
+                assert resp.status == 202
+                data = await resp.json()
+                run_id = data["run_id"]
+
+                for _ in range(20):
+                    status_resp = await cli.get(f"/v1/runs/{run_id}")
+                    status = await status_resp.json()
+                    if status["status"] == "completed":
+                        break
+                    await asyncio.sleep(0.05)
+
+                fake_db.get_messages_as_conversation.assert_called_once_with(
+                    "cron_597928086a82_20260516_185301",
+                    include_ancestors=True,
+                )
+                mock_agent.run_conversation.assert_called_once()
+                assert mock_agent.run_conversation.call_args.kwargs["conversation_history"] == saved_history
+                assert mock_agent.run_conversation.call_args.kwargs["task_id"] == "cron_597928086a82_20260516_185301"
+
+    @pytest.mark.asyncio
     async def test_status_not_found_returns_404(self, adapter):
         app = _create_runs_app(adapter)
         async with TestClient(TestServer(app)) as cli:

@@ -1745,25 +1745,39 @@ class APIServerAdapter(BasePlatformAdapter):
         if key_err is not None:
             return key_err
 
-        # Allow caller to continue an existing session by passing X-Hermes-Session-Id.
-        # When provided, history is loaded from state.db instead of from the request body.
+        # Allow caller to continue an existing session by passing
+        # X-Hermes-Session-Id or a JSON body session_id. Desktop clients often
+        # own the selected session id but use the OpenAI-compatible request
+        # body for transport, so accept both forms.
+        #
+        # When provided, history is loaded from state.db instead of from the
+        # request body.
         #
         # Security: session continuation exposes conversation history, so it is
-        # only allowed when the API key is configured and the request is
-        # authenticated.  Without this gate, any unauthenticated client could
-        # read arbitrary session history by guessing/enumerating session IDs.
-        provided_session_id = request.headers.get("X-Hermes-Session-Id", "").strip()
+        # only allowed without an API key for loopback-bound servers. Without
+        # that gate, any unauthenticated network client could read arbitrary
+        # session history by guessing/enumerating session IDs.
+        raw_body_session_id = body.get("session_id")
+        if raw_body_session_id is not None and not isinstance(raw_body_session_id, str):
+            return web.json_response(
+                {"error": {"message": "Invalid session ID", "type": "invalid_request_error"}},
+                status=400,
+            )
+        provided_session_id = (
+            request.headers.get("X-Hermes-Session-Id", "").strip()
+            or (raw_body_session_id or "").strip()
+        )
         if provided_session_id:
-            if not self._api_key:
+            if not self._api_key and is_network_accessible(self._host):
                 logger.warning(
-                    "Session continuation via X-Hermes-Session-Id rejected: "
-                    "no API key configured.  Set API_SERVER_KEY to enable "
-                    "session continuity."
+                    "Session continuation rejected on network-accessible API "
+                    "server with no API key configured."
                 )
                 return web.json_response(
                     _openai_error(
-                        "Session continuation requires API key authentication. "
-                        "Configure API_SERVER_KEY to enable this feature."
+                        "Session continuation requires API key authentication "
+                        "when the API server is network-accessible. Configure "
+                        "API_SERVER_KEY or bind to loopback."
                     ),
                     status=403,
                 )
@@ -1777,7 +1791,10 @@ class APIServerAdapter(BasePlatformAdapter):
             try:
                 db = self._ensure_session_db()
                 if db is not None:
-                    history = db.get_messages_as_conversation(session_id)
+                    history = db.get_messages_as_conversation(
+                        session_id,
+                        include_ancestors=True,
+                    )
             except Exception as e:
                 logger.warning("Failed to load session history for %s: %s", session_id, e)
                 history = []
@@ -3642,7 +3659,28 @@ class APIServerAdapter(BasePlatformAdapter):
                     conversation_history.append({"role": msg["role"], "content": str(content)})
 
         run_id = f"run_{uuid.uuid4().hex}"
-        session_id = body.get("session_id") or stored_session_id or run_id
+        requested_session_id = str(body.get("session_id") or "").strip()
+        session_id = requested_session_id or stored_session_id or run_id
+
+        # Desktop/API clients can open an existing session from state.db and
+        # continue it by passing session_id.  Unlike Chat Completions, /v1/runs
+        # is not sent a full messages array by those clients, so load the saved
+        # transcript here when no higher-precedence history source was provided.
+        if not conversation_history and requested_session_id:
+            try:
+                db = self._ensure_session_db()
+                if db is not None:
+                    conversation_history = db.get_messages_as_conversation(
+                        requested_session_id,
+                        include_ancestors=True,
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "Failed to load session history for run session_id=%s: %s",
+                    requested_session_id,
+                    exc,
+                )
+
         approval_session_key = gateway_session_key or session_id or run_id
         ephemeral_system_prompt = instructions
         loop = asyncio.get_running_loop()
