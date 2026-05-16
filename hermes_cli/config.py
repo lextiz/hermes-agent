@@ -1111,11 +1111,13 @@ DEFAULT_CONFIG = {
             "exact_failure": 2,
             "same_tool_failure": 3,
             "idempotent_no_progress": 2,
+            "idempotent_tool_streak": 8,
         },
         "hard_stop_after": {
             "exact_failure": 5,
             "same_tool_failure": 8,
             "idempotent_no_progress": 5,
+            "idempotent_tool_streak": 16,
         },
     },
 
@@ -1339,6 +1341,62 @@ DEFAULT_CONFIG = {
             "api_key": "",
             "timeout": 600,
             "extra_body": {},
+        },
+        "orchestration_delegate": {
+            "provider": "auto",
+            "model": "",
+            "base_url": "",
+            "api_key": "",
+            "timeout": 30,
+            "extra_body": {},
+        },
+        "orchestration_validation": {
+            "provider": "auto",
+            "model": "",
+            "base_url": "",
+            "api_key": "",
+            "timeout": 30,
+            "extra_body": {},
+        },
+        "orchestration_escalation": {
+            "provider": "auto",
+            "model": "",
+            "base_url": "",
+            "api_key": "",
+            "timeout": 30,
+            "extra_body": {},
+        },
+    },
+
+    # Compact orchestration decision calls for delegation / validation /
+    # escalation. Disabled by default and fail-open so normal agent behavior
+    # is unchanged unless a caller explicitly opts in.
+    "orchestration": {
+        "enabled": False,
+        "cost_latency_policy": {},
+        "delegation": {
+            "enabled": False,
+            "max_tokens": 500,
+            "timeout": 30,
+            "policy": {},
+        },
+        "validation": {
+            "enabled": False,
+            "max_tokens": 500,
+            "timeout": 30,
+            "validate_without_criteria": False,
+            "freeze_after_successful_check": False,
+        },
+        "escalation": {
+            "enabled": False,
+            "max_tokens": 700,
+            "timeout": 45,
+            "retry_delegated_tasks": True,
+            "retry_main_turns": True,
+            "max_retry_rounds": 2,
+            "target_provider": "",
+            "target_model": "",
+            "target_profile": "",
         },
     },
     

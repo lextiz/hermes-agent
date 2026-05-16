@@ -1967,15 +1967,335 @@ def _recover_tasks_from_json_string(
     return parsed, None
 
 
+def _load_orchestration_config() -> dict:
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config()
+    except Exception:
+        return {}
+    orch = cfg.get("orchestration", {}) if isinstance(cfg, dict) else {}
+    return orch if isinstance(orch, dict) else {}
+
+
+def _orchestration_kind_config(kind: str) -> dict:
+    cfg = _load_orchestration_config()
+    section = cfg.get(kind, {}) if isinstance(cfg, dict) else {}
+    return section if isinstance(section, dict) else {}
+
+
+def _orchestration_truthy(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).strip().lower() in {"1", "true", "yes", "on", "enabled"}
+
+
+def _decision_payload(envelope: Any) -> Dict[str, Any]:
+    if not isinstance(envelope, dict):
+        return {}
+    decision = envelope.get("decision")
+    return decision if isinstance(decision, dict) else envelope
+
+
+def _compact_for_decision(value: Any, *, max_chars: int = 6000) -> Any:
+    if isinstance(value, dict):
+        compact = {
+            k: _compact_for_decision(v, max_chars=max_chars)
+            for k, v in value.items()
+            if k in {
+                "task_index", "status", "summary", "error", "exit_reason",
+                "api_calls", "duration_seconds", "model", "tokens", "tool_trace",
+                "diagnostic_path", "enabled", "called", "kind", "decision",
+                "provider", "parse_failed", "missing_checks", "suggested_commands",
+                "repair_needed", "verdict", "reason",
+            }
+        }
+        return compact
+    if isinstance(value, list):
+        return [_compact_for_decision(v, max_chars=max_chars) for v in value[:12]]
+    if isinstance(value, str) and len(value) > max_chars:
+        return value[:max_chars] + "...[truncated]"
+    return value
+
+
+def _validation_packet(task: Dict[str, Any], entry: Dict[str, Any], criteria: Optional[str]) -> Dict[str, Any]:
+    return {
+        "task": task.get("goal", ""),
+        "acceptance_criteria": criteria or "",
+        "result": _compact_for_decision(entry),
+    }
+
+
+def _run_validation_decision(
+    task: Dict[str, Any],
+    entry: Dict[str, Any],
+    *,
+    acceptance_criteria: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    validation_cfg = _orchestration_kind_config("validation")
+    validate_without_criteria = _orchestration_truthy(
+        validation_cfg.get("validate_without_criteria", False)
+    )
+    if not acceptance_criteria and not validate_without_criteria:
+        return None
+    try:
+        from agent.orchestration_decisions import judge_validation
+
+        envelope = judge_validation(
+            _validation_packet(task, entry, acceptance_criteria)
+        )
+    except Exception as exc:
+        logger.debug("delegation validation decision failed open: %s", exc)
+        return {
+            "enabled": True,
+            "called": False,
+            "kind": "validation",
+            "decision": {
+                "verdict": "uncertain",
+                "missing_checks": ["validation judge unavailable"],
+                "suggested_commands": [],
+                "repair_needed": True,
+                "reason": "validation decision call failed",
+            },
+            "error": str(exc),
+            "parse_failed": False,
+        }
+    return envelope if isinstance(envelope, dict) else None
+
+
+def _validation_requires_repair(validation: Optional[Dict[str, Any]]) -> bool:
+    decision = _decision_payload(validation)
+    if not decision:
+        return False
+    verdict = str(decision.get("verdict") or "").strip().lower()
+    if not verdict and "valid" in decision:
+        verdict = "pass" if decision.get("valid") is True else "fail"
+    return bool(decision.get("repair_needed")) or verdict in {"fail", "failed", "uncertain"}
+
+
+def _failure_packet(
+    task: Dict[str, Any],
+    entry: Dict[str, Any],
+    validation: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    return {
+        "task": task.get("goal", ""),
+        "attempts": [_compact_for_decision(entry)],
+        "errors": [entry.get("error")] if entry.get("error") else [],
+        "verifier_result": _compact_for_decision(validation or {}),
+        "exit_reason": entry.get("exit_reason") or entry.get("status"),
+    }
+
+
+def _entry_failed_or_uncertain(entry: Dict[str, Any], validation: Optional[Dict[str, Any]]) -> bool:
+    status = str(entry.get("status") or "").strip().lower()
+    return status in {"failed", "error", "timeout", "interrupted"} or _validation_requires_repair(validation)
+
+
+def _merge_escalation_context(original_context: Any, failure: Dict[str, Any], compact_prompt: str) -> str:
+    parts = []
+    if original_context:
+        parts.append(str(original_context))
+    parts.append(
+        "Retry runtime note: when the task names an exact Python interpreter path, "
+        "use that path instead of bare python. Use available Hermes file tools or "
+        "real shell commands; do not call apply_patch as a terminal command."
+    )
+    if compact_prompt:
+        parts.append("Escalation prompt from routing judge:\n" + compact_prompt)
+    parts.append(
+        "Failure packet JSON:\n"
+        + json.dumps(failure, ensure_ascii=False, default=str)[:6000]
+    )
+    return "\n\n".join(parts)
+
+
+def _maybe_escalate_delegated_result(
+    *,
+    entry: Dict[str, Any],
+    task: Dict[str, Any],
+    validation: Optional[Dict[str, Any]],
+    cfg: dict,
+    parent_agent,
+    effective_max_iter: int,
+    task_count: int,
+    default_toolsets: Optional[List[str]],
+) -> None:
+    if not _entry_failed_or_uncertain(entry, validation):
+        return
+    failure = _failure_packet(task, entry, validation)
+    try:
+        from agent.orchestration_decisions import decide_escalation
+
+        envelope = decide_escalation(failure)
+    except Exception as exc:
+        logger.debug("delegation escalation decision failed open: %s", exc)
+        envelope = {
+            "enabled": True,
+            "called": False,
+            "kind": "escalation",
+            "decision": {"escalate": False, "reason": "escalation decision call failed"},
+            "error": str(exc),
+            "parse_failed": False,
+        }
+    if not isinstance(envelope, dict):
+        return
+    entry["escalation"] = envelope
+    decision = _decision_payload(envelope)
+    if decision.get("escalate") is not True:
+        return
+
+    esc_cfg = _orchestration_kind_config("escalation")
+    if not _orchestration_truthy(esc_cfg.get("retry_delegated_tasks", True)):
+        entry["escalation"]["retry_skipped"] = "retry_delegated_tasks disabled"
+        return
+
+    configured_model = _clean_optional_str(esc_cfg.get("target_model"))
+    configured_provider = _clean_optional_str(esc_cfg.get("target_provider"))
+    decision_model = _clean_optional_str(decision.get("model"))
+    decision_provider = _clean_optional_str(decision.get("provider"))
+    allow_decision_override = _orchestration_truthy(
+        esc_cfg.get("allow_decision_model_override", False)
+    )
+    if (configured_model or configured_provider) and not allow_decision_override:
+        target_model = configured_model or decision_model
+        target_provider = configured_provider or decision_provider
+    else:
+        target_model = decision_model or configured_model
+        target_provider = decision_provider or configured_provider
+    if not target_model and not target_provider:
+        entry["escalation"]["retry_skipped"] = "no target model/provider configured"
+        return
+    logger.info(
+        "delegation escalation retry target: configured_model=%s configured_provider=%s "
+        "decision_model=%s decision_provider=%s effective_model=%s effective_provider=%s "
+        "allow_decision_override=%s",
+        configured_model,
+        configured_provider,
+        decision_model,
+        decision_provider,
+        target_model,
+        target_provider,
+        allow_decision_override,
+    )
+
+    retry_goal = _clean_optional_str(decision.get("compact_prompt")) or str(task.get("goal") or "")
+    retry_context = _merge_escalation_context(
+        task.get("context"), failure, _clean_optional_str(decision.get("compact_prompt")) or ""
+    )
+    try:
+        task_creds = _resolve_task_delegation_credentials(
+            cfg,
+            parent_agent,
+            task_model=target_model,
+            task_provider=target_provider,
+        )
+    except ValueError as exc:
+        entry["escalation"]["retry_skipped"] = str(exc)
+        return
+
+    import model_tools as _model_tools
+
+    parent_tool_names = list(_model_tools._last_resolved_tool_names)
+    try:
+        child = _build_child_agent(
+            task_index=int(entry.get("task_index") or 0),
+            goal=retry_goal,
+            context=retry_context,
+            toolsets=task.get("toolsets") or default_toolsets,
+            model=task_creds["model"],
+            max_iterations=effective_max_iter,
+            task_count=task_count,
+            parent_agent=parent_agent,
+            override_provider=task_creds["provider"],
+            override_base_url=task_creds["base_url"],
+            override_api_key=task_creds["api_key"],
+            override_api_mode=task_creds["api_mode"],
+            override_acp_command=task_creds.get("command"),
+            override_acp_args=task_creds.get("args"),
+            role="leaf",
+        )
+        child._delegate_saved_tool_names = parent_tool_names
+    finally:
+        _model_tools._last_resolved_tool_names = parent_tool_names
+
+    retry = _run_single_child(int(entry.get("task_index") or 0), retry_goal, child, parent_agent)
+    retry_role = retry.pop("_child_role", None)
+    retry_cost = retry.pop("_child_cost_usd", 0.0)
+    if retry_cost:
+        try:
+            entry["_child_cost_usd"] = float(entry.get("_child_cost_usd", 0.0) or 0.0) + float(retry_cost)
+        except Exception:
+            pass
+    if retry_role:
+        entry["escalation"]["retry_child_role"] = retry_role
+    entry["escalation"]["retry_result"] = retry
+    if retry.get("status") == "completed" and retry.get("summary"):
+        entry["pre_escalation_result"] = _compact_for_decision(dict(entry))
+        for key in ("status", "summary", "api_calls", "duration_seconds", "model", "exit_reason", "tokens", "tool_trace"):
+            if key in retry:
+                entry[key] = retry[key]
+
+
+def _postprocess_orchestration_results(
+    *,
+    results: List[Dict[str, Any]],
+    task_list: List[Dict[str, Any]],
+    parent_agent,
+    cfg: dict,
+    effective_max_iter: int,
+    acceptance_criteria: Optional[str],
+    default_toolsets: Optional[List[str]],
+    allow_escalation_retry: bool = True,
+) -> None:
+    for entry in results:
+        try:
+            idx = int(entry.get("task_index", 0))
+            task = task_list[idx]
+        except Exception:
+            continue
+        entry.setdefault("goal", task.get("goal"))
+        criteria = _clean_optional_str(task.get("acceptance_criteria")) or acceptance_criteria
+        validation = _run_validation_decision(
+            task,
+            entry,
+            acceptance_criteria=criteria,
+        )
+        if isinstance(validation, dict) and (validation.get("called") or validation.get("enabled")):
+            entry["validation"] = validation
+        if not allow_escalation_retry:
+            if _entry_failed_or_uncertain(entry, validation):
+                entry["escalation"] = {
+                    "retry_skipped": "delegated escalation retry disabled by caller"
+                }
+            continue
+        _maybe_escalate_delegated_result(
+            entry=entry,
+            task=task,
+            validation=validation,
+            cfg=cfg,
+            parent_agent=parent_agent,
+            effective_max_iter=effective_max_iter,
+            task_count=len(task_list),
+            default_toolsets=default_toolsets,
+        )
+
+
 def delegate_task(
     goal: Optional[str] = None,
     context: Optional[str] = None,
     toolsets: Optional[List[str]] = None,
+    model: Optional[str] = None,
+    provider: Optional[str] = None,
+    acceptance_criteria: Optional[str] = None,
     tasks: Optional[List[Dict[str, Any]]] = None,
     max_iterations: Optional[int] = None,
     acp_command: Optional[str] = None,
     acp_args: Optional[List[str]] = None,
     role: Optional[str] = None,
+    allow_escalation_retry: bool = True,
     parent_agent=None,
 ) -> str:
     """
@@ -2040,15 +2360,8 @@ def delegate_task(
         )
     effective_max_iter = default_max_iter
 
-    # Resolve delegation credentials (provider:model pair).
-    # When delegation.provider is configured, this resolves the full credential
-    # bundle (base_url, api_key, api_mode) via the same runtime provider system
-    # used by CLI/gateway startup.  When unconfigured, returns None values so
-    # children inherit from the parent.
-    try:
-        creds = _resolve_delegation_credentials(cfg, parent_agent)
-    except ValueError as exc:
-        return tool_error(str(exc))
+    top_model = _clean_optional_str(model)
+    top_provider = _clean_optional_str(provider)
 
     # Normalize to task list
     max_children = _get_max_concurrent_children()
@@ -2070,7 +2383,15 @@ def delegate_task(
         task_list = tasks
     elif goal and isinstance(goal, str) and goal.strip():
         task_list = [
-            {"goal": goal, "context": context, "toolsets": toolsets, "role": top_role}
+            {
+                "goal": goal,
+                "context": context,
+                "toolsets": toolsets,
+                "model": top_model,
+                "provider": top_provider,
+                "acceptance_criteria": acceptance_criteria,
+                "role": top_role,
+            }
         ]
     else:
         return tool_error("Provide either 'goal' (single task) or 'tasks' (batch).")
@@ -2108,6 +2429,18 @@ def delegate_task(
     try:
         for i, t in enumerate(task_list):
             task_acp_args = t.get("acp_args") if "acp_args" in t else None
+            try:
+                task_creds = _resolve_task_delegation_credentials(
+                    cfg,
+                    parent_agent,
+                    top_level_model=top_model,
+                    top_level_provider=top_provider,
+                    task_model=t.get("model"),
+                    task_provider=t.get("provider"),
+                )
+            except ValueError as exc:
+                return tool_error(str(exc))
+
             # Per-task role beats top-level; normalise again so unknown
             # per-task values warn and degrade to leaf uniformly.
             effective_role = _normalize_role(t.get("role") or top_role)
@@ -2116,21 +2449,21 @@ def delegate_task(
                 goal=t["goal"],
                 context=t.get("context"),
                 toolsets=t.get("toolsets") or toolsets,
-                model=creds["model"],
+                model=task_creds["model"],
                 max_iterations=effective_max_iter,
                 task_count=n_tasks,
                 parent_agent=parent_agent,
-                override_provider=creds["provider"],
-                override_base_url=creds["base_url"],
-                override_api_key=creds["api_key"],
-                override_api_mode=creds["api_mode"],
+                override_provider=task_creds["provider"],
+                override_base_url=task_creds["base_url"],
+                override_api_key=task_creds["api_key"],
+                override_api_mode=task_creds["api_mode"],
                 override_acp_command=t.get("acp_command")
                 or acp_command
-                or creds.get("command"),
+                or task_creds.get("command"),
                 override_acp_args=(
                     task_acp_args
                     if task_acp_args is not None
-                    else (acp_args if acp_args is not None else creds.get("args"))
+                    else (acp_args if acp_args is not None else task_creds.get("args"))
                 ),
                 role=effective_role,
             )
@@ -2264,6 +2597,17 @@ def delegate_task(
 
         # Sort by task_index so results match input order
         results.sort(key=lambda r: r["task_index"])
+
+    _postprocess_orchestration_results(
+        results=results,
+        task_list=task_list,
+        parent_agent=parent_agent,
+        cfg=cfg,
+        effective_max_iter=effective_max_iter,
+        acceptance_criteria=_clean_optional_str(acceptance_criteria),
+        default_toolsets=toolsets,
+        allow_escalation_retry=bool(allow_escalation_retry),
+    )
 
     # Notify parent's memory provider of delegation outcomes
     if (
@@ -2453,6 +2797,64 @@ def _resolve_child_credential_pool(
             exc,
         )
     return None
+
+
+def _clean_optional_str(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    cleaned = str(value).strip()
+    return cleaned or None
+
+
+def _resolve_task_delegation_credentials(
+    cfg: dict,
+    parent_agent,
+    *,
+    top_level_model: Optional[str] = None,
+    top_level_provider: Optional[str] = None,
+    task_model: Optional[str] = None,
+    task_provider: Optional[str] = None,
+) -> dict:
+    """Resolve per-child routing with task > call > config > parent precedence.
+
+    Provider overrides are full routing changes, so stale direct-endpoint
+    credentials from the base config are removed before resolving the new
+    provider bundle. Model-only overrides keep the surrounding provider or
+    direct endpoint credential bundle and only retarget the model.
+    """
+    effective_model = (
+        _clean_optional_str(task_model)
+        or _clean_optional_str(top_level_model)
+        or _clean_optional_str(cfg.get("model"))
+    )
+    task_provider_clean = _clean_optional_str(task_provider)
+    top_provider_clean = _clean_optional_str(top_level_provider)
+    effective_provider = (
+        task_provider_clean
+        or top_provider_clean
+        or _clean_optional_str(cfg.get("provider"))
+    )
+
+    resolve_cfg = dict(cfg)
+    if effective_model is not None:
+        resolve_cfg["model"] = effective_model
+    else:
+        resolve_cfg.pop("model", None)
+
+    explicit_provider_override = task_provider_clean is not None or top_provider_clean is not None
+    if effective_provider is not None:
+        resolve_cfg["provider"] = effective_provider
+    else:
+        resolve_cfg.pop("provider", None)
+
+    if explicit_provider_override:
+        # A provider override means a new credential bundle must be resolved.
+        # Do not let delegation.base_url/api_key from the old config short-circuit
+        # runtime provider resolution for the override provider.
+        resolve_cfg.pop("base_url", None)
+        resolve_cfg.pop("api_key", None)
+
+    return _resolve_delegation_credentials(resolve_cfg, parent_agent)
 
 
 def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
@@ -2816,6 +3218,32 @@ DELEGATE_TASK_SCHEMA = {
                     "['terminal', 'file', 'web'] for full-stack tasks."
                 ),
             },
+            "model": {
+                "type": "string",
+                "description": (
+                    "Optional model override for all child agents in this call. "
+                    "Model-only overrides keep the surrounding provider credential "
+                    "bundle (top-level/config/parent) and only change the model."
+                ),
+            },
+            "provider": {
+                "type": "string",
+                "description": (
+                    "Optional provider override for all child agents in this call. "
+                    "Provider overrides re-resolve a fresh credential bundle for "
+                    "the selected provider/model instead of reusing any configured "
+                    "base_url or api_key."
+                ),
+            },
+            "acceptance_criteria": {
+                "type": "string",
+                "description": (
+                    "Optional success criteria for independent validation of "
+                    "delegated work. When orchestration.validation.enabled is "
+                    "true, a compact auxiliary judge evaluates the result against "
+                    "these criteria and returns pass/fail/uncertain metadata."
+                ),
+            },
             "tasks": {
                 "type": "array",
                 "items": {
@@ -2830,6 +3258,26 @@ DELEGATE_TASK_SCHEMA = {
                             "type": "array",
                             "items": {"type": "string"},
                             "description": f"Toolsets for this specific task. Available: {_TOOLSET_LIST_STR}. Use 'web' for network access, 'terminal' for shell, 'browser' for web interaction.",
+                        },
+                        "model": {
+                            "type": "string",
+                            "description": (
+                                "Per-task model override. Beats the top-level model. "
+                                "Without a provider override, this keeps the surrounding "
+                                "provider credential bundle and only changes the model."
+                            ),
+                        },
+                        "provider": {
+                            "type": "string",
+                            "description": (
+                                "Per-task provider override. Beats the top-level provider "
+                                "and re-resolves fresh credentials for this task's "
+                                "provider/model instead of reusing stale base_url/api_key."
+                            ),
+                        },
+                        "acceptance_criteria": {
+                            "type": "string",
+                            "description": "Task-specific success criteria for the independent validation judge.",
                         },
                         "acp_command": {
                             "type": "string",
@@ -2901,6 +3349,9 @@ registry.register(
         goal=args.get("goal"),
         context=args.get("context"),
         toolsets=args.get("toolsets"),
+        model=args.get("model"),
+        provider=args.get("provider"),
+        acceptance_criteria=args.get("acceptance_criteria"),
         tasks=args.get("tasks"),
         max_iterations=args.get("max_iterations"),
         acp_command=args.get("acp_command"),

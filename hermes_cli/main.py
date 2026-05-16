@@ -2974,6 +2974,9 @@ _AUX_TASKS: list[tuple[str, str, str]] = [
     ("kanban_decomposer", "Kanban decomposer", "task decomposition"),
     ("profile_describer", "Profile describer", "auto profile descriptions"),
     ("curator", "Curator", "skill-usage review pass"),
+    ("orchestration_delegate", "Orchestration delegate", "pre-turn delegation judge"),
+    ("orchestration_validation", "Orchestration validation", "post-work validation judge"),
+    ("orchestration_escalation", "Orchestration escalation", "failure escalation router"),
 ]
 
 
