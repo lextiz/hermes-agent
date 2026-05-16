@@ -2133,6 +2133,9 @@ _AUX_TASKS: list[tuple[str, str, str]] = [
     ("title_generation", "Title generation", "session titles"),
     ("skills_hub", "Skills hub", "skills search/install"),
     ("curator", "Curator", "skill-usage review pass"),
+    ("orchestration_delegate", "Orchestration delegate", "pre-turn delegation judge"),
+    ("orchestration_validation", "Orchestration validation", "post-work validation judge"),
+    ("orchestration_escalation", "Orchestration escalation", "failure escalation router"),
 ]
 
 
