@@ -609,6 +609,14 @@ agent:
   # Set to 0 to disable the warning.
   # gateway_timeout_warning: 900
 
+  # One-shot intermediate-response threshold for gateway turns (seconds).
+  # If a request runs longer than this with no user-visible assistant content,
+  # Hermes sends a brief status note, steers the model to provide an interim
+  # update at the next safe point, and keeps working until the final answer.
+  # Disabled by default. Set to 10 for a quick status note after 10 seconds.
+  # Set to 0 to disable.
+  # gateway_intermediate_response_timeout: 0
+
   # Graceful drain timeout for gateway stop/restart (seconds).
   # The gateway stops accepting new work, waits for in-flight agents to
   # finish, then interrupts anything still running after this timeout.

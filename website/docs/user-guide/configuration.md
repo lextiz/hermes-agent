@@ -852,6 +852,17 @@ The **stale stream detection** kills connections that receive SSE keep-alive pin
 
 The **stale non-stream detection** kills non-streaming calls that produce no response for too long. By default Hermes disables this on local endpoints to avoid false positives during long prefills. If you explicitly set `providers.<id>.stale_timeout_seconds`, `providers.<id>.models.<model>.stale_timeout_seconds`, or `HERMES_API_CALL_STALE_TIMEOUT`, that explicit value is honored even on local endpoints.
 
+### Gateway Intermediate Responses
+
+Messaging gateway turns already run in the background. To avoid leaving users waiting silently on longer requests, Hermes can send a one-shot status note and steer the running model to produce a concise interim update at the next safe point:
+
+```yaml
+agent:
+  gateway_intermediate_response_timeout: 0  # seconds, disabled by default
+```
+
+Set this to `10` for a quick status note after 10 seconds. The gateway does not stop or restart the turn. It keeps the original work running and delivers the complete final response when the agent finishes. This is separate from `agent.gateway_notify_interval`, which sends periodic "still working" pings for much longer runs.
+
 ## Context Pressure Warnings
 
 Separate from iteration budget pressure, context pressure tracks how close the conversation is to the **compaction threshold** — the point where context compression fires to summarize older messages. This helps both you and the agent understand when the conversation is getting long.

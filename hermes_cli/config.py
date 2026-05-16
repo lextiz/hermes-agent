@@ -985,6 +985,14 @@ DEFAULT_CONFIG = {
         # (60+ tool iterations with tiny output) before users assume the
         # bot is dead and /restart.
         "gateway_notify_interval": 180,
+        # Wall-clock threshold for the gateway's one-shot intermediate
+        # response prompt (seconds). When a turn runs longer than this with
+        # no user-visible assistant content, the gateway sends a brief status
+        # note and steers the running agent to produce an interim update at
+        # the next safe opportunity while continuing the original task.
+        # Disabled by default for upstream; set to 10 for a quick status note.
+        # 0 = disable.
+        "gateway_intermediate_response_timeout": 0,
         # Freshness window for the gateway auto-continue note (seconds).
         # After a gateway crash/restart/SIGTERM mid-run, the next user
         # message gets a "[System note: your previous turn was

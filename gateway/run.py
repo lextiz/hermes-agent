@@ -586,6 +586,79 @@ def _float_env(name: str, default: float) -> float:
         return float(default)
 
 
+def _float_config_or_env(
+    config: Dict[str, Any],
+    section: str,
+    key: str,
+    env_name: str,
+    default: float,
+) -> float:
+    """Read a numeric config value, letting config.yaml beat .env.
+
+    The gateway bridges many config.yaml keys into env vars at import time,
+    but per-turn code may read before that bridge has refreshed in long-lived
+    tests or after config edits. Reading config directly keeps config.yaml
+    authoritative while preserving env fallback when the key is omitted.
+    """
+    section_cfg = config.get(section) if isinstance(config, dict) else None
+    if isinstance(section_cfg, dict) and key in section_cfg:
+        try:
+            return float(section_cfg.get(key))
+        except (TypeError, ValueError):
+            return float(default)
+    return _float_env(env_name, default)
+
+
+def _format_elapsed_seconds(seconds: float) -> str:
+    if seconds < 60:
+        return f"{max(1, int(round(seconds)))}s"
+    minutes = seconds / 60.0
+    if minutes < 10:
+        return f"{minutes:.1f} min"
+    return f"{int(round(minutes))} min"
+
+
+def _gateway_intermediate_activity_parts(activity: Dict[str, Any]) -> List[str]:
+    parts: List[str] = []
+    api_call_count = activity.get("api_call_count")
+    max_iterations = activity.get("max_iterations")
+    if api_call_count and max_iterations:
+        parts.append(f"iteration {api_call_count}/{max_iterations}")
+    current_tool = activity.get("current_tool")
+    if current_tool:
+        parts.append(f"running `{current_tool}`")
+    else:
+        desc = str(activity.get("last_activity_desc") or "").strip()
+        if desc and desc != "initializing":
+            parts.append(desc)
+    return parts
+
+
+def _gateway_intermediate_notice(elapsed_seconds: float, activity: Dict[str, Any]) -> str:
+    """User-facing one-shot note for a slow gateway turn."""
+    status = ", ".join(_gateway_intermediate_activity_parts(activity))
+    suffix = f" Status: {status}." if status else ""
+    elapsed = _format_elapsed_seconds(elapsed_seconds)
+    return (
+        f"Still working after {elapsed}. I will keep going in the background "
+        f"and send the complete response here when it is ready.{suffix}"
+    )
+
+
+def _gateway_intermediate_steer(elapsed_seconds: float, activity: Dict[str, Any]) -> str:
+    """Instruction injected into the running agent after the slow-turn threshold."""
+    status = ", ".join(_gateway_intermediate_activity_parts(activity))
+    elapsed = _format_elapsed_seconds(elapsed_seconds)
+    status_sentence = f" Current status: {status}." if status else ""
+    return (
+        f"The user has been waiting for {elapsed}.{status_sentence} At the next "
+        "safe opportunity, send a concise interim response before continuing: "
+        "state what you know or have done so far, clearly label uncertainty or "
+        "speculation, mention the next step, and then continue the original "
+        "task to completion. Do not stop just because you sent the interim update."
+    )
+
+
 def _is_fresh_gateway_interruption(
     value: Any,
     *,
@@ -1496,6 +1569,10 @@ if _config_path.exists():
                 os.environ["HERMES_AGENT_TIMEOUT_WARNING"] = str(_agent_cfg["gateway_timeout_warning"])
             if "gateway_notify_interval" in _agent_cfg:
                 os.environ["HERMES_AGENT_NOTIFY_INTERVAL"] = str(_agent_cfg["gateway_notify_interval"])
+            if "gateway_intermediate_response_timeout" in _agent_cfg:
+                os.environ["HERMES_AGENT_INTERMEDIATE_RESPONSE_TIMEOUT"] = str(
+                    _agent_cfg["gateway_intermediate_response_timeout"]
+                )
             if "restart_drain_timeout" in _agent_cfg:
                 os.environ["HERMES_RESTART_DRAIN_TIMEOUT"] = str(_agent_cfg["restart_drain_timeout"])
             if "gateway_auto_continue_freshness" in _agent_cfg:
@@ -15001,6 +15078,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         result_holder = [None]  # Mutable container for the result
         tools_holder = [None]   # Mutable container for the tool definitions
         stream_consumer_holder = [None]  # Mutable container for stream consumer
+        interim_user_visible = [False]  # True once assistant content/status was surfaced
         
         # Bridge sync step_callback → async hooks.emit for agent:step events
         _loop_for_step = asyncio.get_running_loop()
@@ -15232,6 +15310,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if not _run_still_current():
                     return
                 if _stream_consumer is not None:
+                    interim_user_visible[0] = True
                     if already_streamed:
                         _stream_consumer.on_segment_break()
                     else:
@@ -15239,6 +15318,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     return
                 if already_streamed or not _status_adapter or not str(text or "").strip():
                     return
+                interim_user_visible[0] = True
                 safe_schedule_threadsafe(
                     _status_adapter.send(
                         _status_chat_id,
@@ -16290,6 +16370,90 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         _notify_task = asyncio.create_task(_notify_long_running())
 
+        _INTERMEDIATE_RESPONSE_DEFAULT = 0.0
+        _intermediate_timeout_raw = _float_config_or_env(
+            user_config,
+            "agent",
+            "gateway_intermediate_response_timeout",
+            "HERMES_AGENT_INTERMEDIATE_RESPONSE_TIMEOUT",
+            _INTERMEDIATE_RESPONSE_DEFAULT,
+        )
+        _intermediate_timeout = (
+            _intermediate_timeout_raw
+            if _intermediate_timeout_raw > 0
+            and getattr(source.platform, "value", source.platform) != "webhook"
+            else None
+        )
+        _intermediate_started = time.monotonic()
+        _intermediate_notice_sent = [False]
+        _intermediate_steer_sent = [False]
+
+        def _activity_snapshot() -> Dict[str, Any]:
+            _agent_ref = agent_holder[0]
+            if _agent_ref and hasattr(_agent_ref, "get_activity_summary"):
+                try:
+                    return _agent_ref.get_activity_summary()
+                except Exception:
+                    return {}
+            return {}
+
+        def _has_user_visible_assistant_output() -> bool:
+            if interim_user_visible[0]:
+                return True
+            _sc = stream_consumer_holder[0]
+            if _sc is None:
+                return False
+            return bool(
+                getattr(_sc, "already_sent", False)
+                or getattr(_sc, "final_content_delivered", False)
+                or getattr(_sc, "final_response_sent", False)
+            )
+
+        async def _maybe_fire_intermediate_response() -> None:
+            if _intermediate_timeout is None or not _run_still_current():
+                return
+            elapsed = time.monotonic() - _intermediate_started
+            if elapsed < _intermediate_timeout:
+                return
+            if result_holder[0] is not None:
+                return
+            already_visible = _has_user_visible_assistant_output()
+            if already_visible and not _intermediate_notice_sent[0]:
+                return
+
+            activity = _activity_snapshot()
+            agent_ref = agent_holder[0]
+            if (
+                not _intermediate_steer_sent[0]
+                and agent_ref is not None
+                and hasattr(agent_ref, "steer")
+            ):
+                _intermediate_steer_sent[0] = True
+                try:
+                    agent_ref.steer(_gateway_intermediate_steer(elapsed, activity))
+                except Exception as exc:
+                    logger.debug("Intermediate response steer failed: %s", exc)
+
+            if _intermediate_notice_sent[0]:
+                return
+            _intermediate_notice_sent[0] = True
+            adapter = self.adapters.get(source.platform)
+            if not adapter:
+                return
+            try:
+                res = await adapter.send(
+                    source.chat_id,
+                    _gateway_intermediate_notice(elapsed, activity),
+                    metadata=_status_thread_metadata,
+                )
+                if getattr(res, "success", False):
+                    interim_user_visible[0] = True
+                    mid = getattr(res, "message_id", None)
+                    if _cleanup_progress and mid:
+                        _cleanup_msg_ids.append(str(mid))
+            except Exception as exc:
+                logger.debug("Intermediate response notice send failed: %s", exc)
+
         try:
             # Run in thread pool to not block.  Use an *inactivity*-based
             # timeout instead of a wall-clock limit: the agent can run for
@@ -16311,6 +16475,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             _inactivity_timeout = False
             _POLL_INTERVAL = 5.0
+            if _intermediate_timeout is not None:
+                _POLL_INTERVAL = min(_POLL_INTERVAL, max(0.1, _intermediate_timeout / 2.0))
 
             if _agent_timeout is None:
                 # Unlimited — still poll periodically for backup interrupt
@@ -16323,6 +16489,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if done:
                         response = _executor_task.result()
                         break
+                    await _maybe_fire_intermediate_response()
                     # Backup interrupt check: if the monitor task died or
                     # missed the interrupt, catch it here.
                     if not _interrupt_detected.is_set() and session_key:
@@ -16362,6 +16529,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             _idle_secs = _act.get("seconds_since_activity", 0.0)
                         except Exception:
                             pass
+                    await _maybe_fire_intermediate_response()
                     # Staged warning: fire once before escalating to full timeout.
                     if (not _warning_fired and _agent_warning is not None
                             and _idle_secs >= _agent_warning):

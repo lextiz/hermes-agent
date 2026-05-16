@@ -675,6 +675,36 @@ class VerboseAgent:
         }
 
 
+class SlowIntermediateAgent:
+    instances = []
+
+    def __init__(self, **kwargs):
+        self.tools = []
+        self.steers = []
+        type(self).instances.append(self)
+
+    def get_activity_summary(self):
+        return {
+            "last_activity_desc": "waiting for provider response",
+            "seconds_since_activity": 0.1,
+            "current_tool": None,
+            "api_call_count": 1,
+            "max_iterations": 90,
+        }
+
+    def steer(self, text):
+        self.steers.append(text)
+        return True
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        time.sleep(0.25)
+        return {
+            "final_response": "done",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
 async def _run_with_agent(
     monkeypatch,
     tmp_path,
@@ -768,6 +798,49 @@ async def test_run_agent_rolls_progress_bubble_before_platform_limit(monkeypatch
     assert adapter.oversized_edits == []
     all_bubbles = [call["content"] for call in adapter.sent + adapter.edits]
     assert all(len(text) <= adapter.MAX_MESSAGE_LENGTH for text in all_bubbles)
+
+
+@pytest.mark.asyncio
+async def test_run_agent_sends_intermediate_notice_and_steers_slow_turn(monkeypatch, tmp_path):
+    SlowIntermediateAgent.instances = []
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        SlowIntermediateAgent,
+        session_id="sess-intermediate-response",
+        config_data={
+            "agent": {"gateway_intermediate_response_timeout": 0.05},
+            "display": {"tool_progress": "off"},
+        },
+    )
+
+    assert result["final_response"] == "done"
+    assert any("Still working after" in call["content"] for call in adapter.sent)
+    assert SlowIntermediateAgent.instances
+    assert any(
+        "concise interim response" in steer
+        for steer in SlowIntermediateAgent.instances[0].steers
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_agent_intermediate_notice_can_be_disabled(monkeypatch, tmp_path):
+    SlowIntermediateAgent.instances = []
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        SlowIntermediateAgent,
+        session_id="sess-intermediate-disabled",
+        config_data={
+            "agent": {"gateway_intermediate_response_timeout": 0},
+            "display": {"tool_progress": "off"},
+        },
+    )
+
+    assert result["final_response"] == "done"
+    assert not any("Still working after" in call["content"] for call in adapter.sent)
+    assert SlowIntermediateAgent.instances
+    assert SlowIntermediateAgent.instances[0].steers == []
 
 
 @pytest.mark.asyncio
