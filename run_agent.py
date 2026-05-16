@@ -31,6 +31,7 @@ except ModuleNotFoundError:
     # means UTF-8 stdio setup is skipped on Windows; POSIX is unaffected.
     pass
 
+import ast
 import asyncio
 import base64
 import concurrent.futures
@@ -44,6 +45,7 @@ import os
 import random
 import re
 import ssl
+import subprocess
 import sys
 import tempfile
 import time
@@ -191,6 +193,57 @@ from agent.trajectory import (
 )
 from utils import atomic_json_write, base_url_host_matches, base_url_hostname, env_var_enabled, normalize_proxy_url
 from hermes_cli.config import cfg_get
+
+
+def decide_delegation(packet: Dict[str, Any]) -> Dict[str, Any]:
+    """Lazy orchestration delegation judge wrapper.
+
+    The judge module is optional during rollout. Missing imports or judge
+    failures fail open so the normal agent turn proceeds unchanged.
+    """
+    try:
+        from agent.orchestration_decisions import decide_delegation as _decide
+        decision = _decide(packet)
+        return decision if isinstance(decision, dict) else {"delegate": False, "tasks": []}
+    except Exception as exc:
+        logger.warning("orchestration delegation decision failed open: %s", exc, exc_info=True)
+        return {"delegate": False, "tasks": [], "error": str(exc)}
+
+
+def judge_validation(packet: Dict[str, Any]) -> Dict[str, Any]:
+    """Lazy orchestration validation judge wrapper."""
+    try:
+        from agent.orchestration_decisions import judge_validation as _judge
+        decision = _judge(packet)
+        return decision if isinstance(decision, dict) else {"verdict": "pass"}
+    except Exception as exc:
+        logger.warning("orchestration validation decision failed open: %s", exc, exc_info=True)
+        return {
+            "verdict": "uncertain",
+            "missing_checks": ["validation judge unavailable"],
+            "suggested_commands": [],
+            "repair_needed": True,
+            "error": str(exc),
+        }
+
+
+def decide_escalation(packet: Dict[str, Any]) -> Dict[str, Any]:
+    """Lazy orchestration escalation judge wrapper for future exit hooks."""
+    try:
+        from agent.orchestration_decisions import decide_escalation as _decide
+        decision = _decide(packet)
+        return decision if isinstance(decision, dict) else {"escalate": False}
+    except Exception as exc:
+        logger.warning("orchestration escalation decision failed open: %s", exc, exc_info=True)
+        return {"escalate": False, "error": str(exc)}
+
+
+def _config_truthy(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).strip().lower() in {"1", "true", "yes", "on", "enabled"}
 
 
 
@@ -581,6 +634,81 @@ def _extract_file_mutation_targets(tool_name: str, args: Dict[str, Any]) -> List
                 paths.append(p)
         return paths
     return []
+
+
+_EXECUTE_CODE_MUTATING_CALLS = {
+    "write_file",
+    "patch",
+    "remove",
+    "unlink",
+    "rename",
+    "replace",
+    "rmdir",
+    "removedirs",
+    "makedirs",
+}
+_EXECUTE_CODE_MUTATING_METHODS = {
+    "write",
+    "writelines",
+    "write_text",
+    "write_bytes",
+    "touch",
+    "unlink",
+    "rename",
+    "replace",
+    "rmdir",
+    "mkdir",
+}
+
+
+def _execute_code_may_mutate_files(args: Dict[str, Any]) -> bool:
+    """Return True when execute_code source appears to change workspace files.
+
+    The post-success mutation guard can freeze known ``write_file`` and
+    ``patch`` targets, but execute_code may mutate files through Python APIs or
+    sandbox tool calls that do not expose changed paths in the tool result. In
+    that case, the guard should stay unarmed rather than block a legitimate
+    later repair based on incomplete mutation history.
+    """
+    code = args.get("code")
+    if not isinstance(code, str) or not code.strip():
+        return False
+
+    def _name(node: ast.AST) -> str:
+        if isinstance(node, ast.Name):
+            return node.id
+        if isinstance(node, ast.Attribute):
+            return node.attr
+        return ""
+
+    def _literal_str(node: ast.AST | None) -> str | None:
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return node.value
+        return None
+
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return bool(
+            re.search(r"\b(?:write_file|patch|write_text|write_bytes)\s*\(", code)
+            or re.search(r"\bopen\s*\([^)]*,\s*['\"][^'\"]*[wax+]", code)
+        )
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        name = _name(node.func)
+        if name in _EXECUTE_CODE_MUTATING_CALLS or name in _EXECUTE_CODE_MUTATING_METHODS:
+            return True
+        if name == "open":
+            mode = _literal_str(node.args[1]) if len(node.args) >= 2 else None
+            for kw in node.keywords:
+                if kw.arg == "mode":
+                    mode = _literal_str(kw.value)
+                    break
+            if mode and any(ch in mode for ch in "wax+"):
+                return True
+    return False
 
 
 def _extract_error_preview(result: Any, max_len: int = 180) -> str:
@@ -2016,6 +2144,11 @@ class AIAgent:
             _agent_cfg = _load_agent_config()
         except Exception:
             _agent_cfg = {}
+        self._orchestration_cfg = (
+            _agent_cfg.get("orchestration", {})
+            if isinstance(_agent_cfg.get("orchestration", {}), dict)
+            else {}
+        )
         try:
             self._tool_guardrails = ToolCallGuardrailController(
                 ToolCallGuardrailConfig.from_mapping(
@@ -4333,6 +4466,10 @@ class AIAgent:
         forked conversation. Writes directly to the shared memory/skill stores.
         Never modifies the main conversation history or produces user-visible output.
         """
+        if os.environ.get("HERMES_DISABLE_BACKGROUND_REVIEW") == "1":
+            logger.info("background review skipped by configuration")
+            return
+
         import threading
 
         # Pick the right prompt based on which triggers fired
@@ -4361,7 +4498,7 @@ class AIAgent:
             except Exception:
                 pass
             review_agent = None
-            review_messages = []
+            review_messages: List[Dict] = []
             try:
                 with open(os.devnull, "w", encoding="utf-8") as _devnull, \
                      contextlib.redirect_stdout(_devnull), \
@@ -4491,6 +4628,7 @@ class AIAgent:
                         review_agent.shutdown_memory_provider()
                     except Exception:
                         pass
+                    review_messages = getattr(review_agent, "_session_messages", []) or []
                     try:
                         review_agent.close()
                     except Exception:
@@ -5637,6 +5775,137 @@ class AIAgent:
         except Exception:
             pass
         return True  # safe default: verifier on
+
+    def _freeze_after_successful_check_enabled(self) -> bool:
+        if getattr(self, "_delegate_depth", 0) > 0:
+            return False
+        cfg = getattr(self, "_orchestration_cfg", {}) or {}
+        if not isinstance(cfg, dict) or not _config_truthy(cfg.get("enabled", False)):
+            return False
+        validation_cfg = cfg.get("validation", {})
+        if not isinstance(validation_cfg, dict):
+            return False
+        return _config_truthy(validation_cfg.get("freeze_after_successful_check", False))
+
+    def _post_success_mutation_block_message(self, tool_name: str, args: Dict[str, Any]) -> Optional[str]:
+        if not self._freeze_after_successful_check_enabled():
+            return None
+        if not getattr(self, "_post_success_mutation_guard_seen", False):
+            return None
+
+        def _halt_with_message(message: str) -> str:
+            count = int(getattr(self, "_post_success_mutation_block_count", 0) or 0) + 1
+            self._post_success_mutation_block_count = count
+            self._set_tool_guardrail_halt(
+                ToolGuardrailDecision(
+                    action="halt",
+                    code="post_success_mutation_block",
+                    message=message,
+                    tool_name=tool_name,
+                    count=count,
+                )
+            )
+            return message
+
+        if tool_name in _FILE_MUTATING_TOOLS:
+            targets = set(_extract_file_mutation_targets(tool_name, args))
+            allowed = getattr(self, "_post_success_allowed_mutation_paths", set()) or set()
+            blocked = sorted(path for path in targets if path not in allowed)
+            if blocked:
+                return _halt_with_message(
+                    "Post-success mutation guard blocked this file change. "
+                    "A verification command already passed; only files changed before "
+                    f"that successful check may be edited now. Blocked path(s): {', '.join(blocked)}"
+                )
+        if tool_name == "terminal" and _is_destructive_command(str(args.get("command") or "")):
+            return _halt_with_message(
+                "Post-success mutation guard blocked this destructive shell command. "
+                "A verification command already passed; run read-only checks or finish instead."
+            )
+        return None
+
+    @staticmethod
+    def _terminal_result_succeeded(result: Any) -> bool:
+        text = _multimodal_text_summary(result)
+        try:
+            parsed = json.loads(text)
+        except Exception:
+            return False
+        if not isinstance(parsed, dict):
+            return False
+        code = parsed.get("exit_code", parsed.get("returncode"))
+        return code == 0
+
+    @staticmethod
+    def _looks_like_verification_command(command: str) -> bool:
+        cmd = str(command or "").strip().lower()
+        if not cmd:
+            return False
+        patterns = (
+            " -m unittest",
+            " -m pytest",
+            " pytest",
+            "unittest",
+            "npm test",
+            "pnpm test",
+            "yarn test",
+            "go test",
+            "cargo test",
+            "run_pipeline.sh",
+            "verify_",
+        )
+        return any(pattern in cmd for pattern in patterns)
+
+    def _record_post_success_mutation_state(
+        self,
+        tool_name: str,
+        args: Dict[str, Any],
+        result: Any,
+        is_error: bool,
+    ) -> None:
+        if not self._freeze_after_successful_check_enabled():
+            return
+
+        changed_before_success = getattr(self, "_post_success_changed_paths", None)
+        if changed_before_success is None:
+            changed_before_success = set()
+            self._post_success_changed_paths = changed_before_success
+
+        if tool_name in _FILE_MUTATING_TOOLS and not is_error and file_mutation_result_landed(tool_name, result):
+            targets = _extract_file_mutation_targets(tool_name, args)
+            if not getattr(self, "_post_success_mutation_guard_seen", False):
+                changed_before_success.update(targets)
+            else:
+                allowed = getattr(self, "_post_success_allowed_mutation_paths", set()) or set()
+                allowed.update(path for path in targets if path in allowed)
+                self._post_success_allowed_mutation_paths = allowed
+
+        if (
+            tool_name == "execute_code"
+            and not getattr(self, "_post_success_mutation_guard_seen", False)
+            and _execute_code_may_mutate_files(args)
+        ):
+            self._post_success_mutation_history_unknown = True
+
+        if (
+            tool_name == "terminal"
+            and not is_error
+            and self._looks_like_verification_command(str(args.get("command") or ""))
+            and self._terminal_result_succeeded(result)
+            and not getattr(self, "_post_success_mutation_guard_seen", False)
+        ):
+            if getattr(self, "_post_success_mutation_history_unknown", False):
+                logger.info(
+                    "post-success mutation guard not armed: execute_code mutation history is incomplete"
+                )
+                return
+            self._post_success_mutation_guard_seen = True
+            self._post_success_allowed_mutation_paths = set(changed_before_success)
+            logger.info(
+                "post-success mutation guard armed: allowed_paths=%s command=%s",
+                sorted(self._post_success_allowed_mutation_paths),
+                str(args.get("command") or "")[:200],
+            )
 
     @staticmethod
     def _format_file_mutation_failure_footer(failed: Dict[str, Dict[str, Any]]) -> str:
@@ -10955,6 +11224,10 @@ class AIAgent:
             acp_command=function_args.get("acp_command"),
             acp_args=function_args.get("acp_args"),
             role=function_args.get("role"),
+            model=function_args.get("model"),
+            provider=function_args.get("provider"),
+            acceptance_criteria=function_args.get("acceptance_criteria"),
+            allow_escalation_retry=function_args.get("allow_escalation_retry", True),
             parent_agent=self,
         )
 
@@ -10977,6 +11250,10 @@ class AIAgent:
                 )
             except Exception:
                 pass
+        if block_message is not None:
+            return json.dumps({"error": block_message}, ensure_ascii=False)
+
+        block_message = self._post_success_mutation_block_message(function_name, function_args)
         if block_message is not None:
             return json.dumps({"error": block_message}, ensure_ascii=False)
 
@@ -11144,10 +11421,15 @@ class AIAgent:
             if block_message is not None:
                 block_result = json.dumps({"error": block_message}, ensure_ascii=False)
             else:
-                guardrail_decision = self._tool_guardrails.before_call(function_name, function_args)
-                if not guardrail_decision.allows_execution:
-                    block_result = self._guardrail_block_result(guardrail_decision)
+                post_success_block = self._post_success_mutation_block_message(function_name, function_args)
+                if post_success_block is not None:
+                    block_result = json.dumps({"error": post_success_block}, ensure_ascii=False)
                     blocked_by_guardrail = True
+                else:
+                    guardrail_decision = self._tool_guardrails.before_call(function_name, function_args)
+                    if not guardrail_decision.allows_execution:
+                        block_result = self._guardrail_block_result(guardrail_decision)
+                        blocked_by_guardrail = True
 
             parsed_calls.append((tool_call, function_name, function_args, block_result, blocked_by_guardrail))
 
@@ -11386,6 +11668,9 @@ class AIAgent:
                 # block count as either a failure or a success.
                 if not blocked:
                     try:
+                        self._record_post_success_mutation_state(
+                            function_name, function_args, function_result, is_error,
+                        )
                         self._record_file_mutation_result(
                             function_name, function_args, function_result, is_error,
                         )
@@ -11520,12 +11805,19 @@ class AIAgent:
                 pass
 
             _guardrail_block_decision: ToolGuardrailDecision | None = None
+            _post_success_block_msg: Optional[str] = None
             if _block_msg is None:
-                guardrail_decision = self._tool_guardrails.before_call(function_name, function_args)
-                if not guardrail_decision.allows_execution:
-                    _guardrail_block_decision = guardrail_decision
+                _post_success_block_msg = self._post_success_mutation_block_message(function_name, function_args)
+                if _post_success_block_msg is None:
+                    guardrail_decision = self._tool_guardrails.before_call(function_name, function_args)
+                    if not guardrail_decision.allows_execution:
+                        _guardrail_block_decision = guardrail_decision
 
-            _execution_blocked = _block_msg is not None or _guardrail_block_decision is not None
+            _execution_blocked = (
+                _block_msg is not None
+                or _post_success_block_msg is not None
+                or _guardrail_block_decision is not None
+            )
 
             if _execution_blocked:
                 # Tool blocked by plugin or guardrail policy — skip counters,
@@ -11602,6 +11894,9 @@ class AIAgent:
             if _block_msg is not None:
                 # Tool blocked by plugin policy — return error without executing.
                 function_result = json.dumps({"error": _block_msg}, ensure_ascii=False)
+                tool_duration = 0.0
+            elif _post_success_block_msg is not None:
+                function_result = json.dumps({"error": _post_success_block_msg}, ensure_ascii=False)
                 tool_duration = 0.0
             elif _guardrail_block_decision is not None:
                 # Tool blocked by tool-loop guardrail — synthesize exactly one
@@ -11820,6 +12115,9 @@ class AIAgent:
             # turn, not just the parallel ones.
             if not _execution_blocked:
                 try:
+                    self._record_post_success_mutation_state(
+                        function_name, function_args, function_result, _is_error_result,
+                    )
                     self._record_file_mutation_result(
                         function_name, function_args, function_result, _is_error_result,
                     )
@@ -11917,6 +12215,804 @@ class AIAgent:
         # applied to sequential execution as well.
         if num_tools_seq > 0:
             self._apply_pending_steer_to_tool_results(messages, num_tools_seq)
+
+
+    def _orchestration_delegation_enabled(self) -> bool:
+        cfg = getattr(self, "_orchestration_cfg", {}) or {}
+        if not isinstance(cfg, dict) or not _config_truthy(cfg.get("enabled", False)):
+            return False
+        delegation_cfg = cfg.get("delegation", {})
+        if not isinstance(delegation_cfg, dict):
+            return False
+        return _config_truthy(delegation_cfg.get("enabled", False))
+
+    def _orchestration_cost_latency_policy(self) -> Dict[str, Any]:
+        cfg = getattr(self, "_orchestration_cfg", {}) or {}
+        delegation_cfg = cfg.get("delegation", {}) if isinstance(cfg, dict) else {}
+        if not isinstance(delegation_cfg, dict):
+            delegation_cfg = {}
+
+        policy: Dict[str, Any] = {}
+        for source in (
+            cfg.get("cost_latency_policy") if isinstance(cfg, dict) else None,
+            cfg.get("policy") if isinstance(cfg, dict) else None,
+            delegation_cfg.get("policy"),
+        ):
+            if isinstance(source, dict):
+                policy.update(
+                    {
+                        str(k): v
+                        for k, v in source.items()
+                        if isinstance(v, (str, int, float, bool)) or v is None
+                    }
+                )
+
+        for key in (
+            "max_cost_usd",
+            "max_latency_seconds",
+            "latency_preference",
+            "cost_preference",
+            "prefer",
+            "priority",
+        ):
+            if key in delegation_cfg and key not in policy:
+                value = delegation_cfg.get(key)
+                if isinstance(value, (str, int, float, bool)) or value is None:
+                    policy[key] = value
+        return policy
+
+    def _orchestration_task_hints(self) -> Dict[str, Any]:
+        """Return compact task metadata for orchestration judges when available."""
+        candidates: list[Path] = []
+        for env_name in ("HERMES_ORCHESTRATION_TASK_CONTEXT_PATH", "HERMES_TASK_CONTEXT_PATH"):
+            context_path = os.environ.get(env_name)
+            if context_path:
+                candidates.append(Path(context_path))
+
+        for path in candidates:
+            try:
+                if not path.is_file():
+                    continue
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if not isinstance(data, dict):
+                continue
+            allowed_keys = (
+                "id",
+                "category",
+                "difficulty",
+                "severity",
+                "tags",
+                "objective",
+                "validation_hints",
+                "acceptance_hints",
+                "acceptance_criteria",
+                "requirements",
+                "risk",
+                "risk_level",
+            )
+            hints = {key: data.get(key) for key in allowed_keys if key in data}
+            hints["source"] = str(path)
+            return hints
+        return {}
+
+    @staticmethod
+    def _orchestration_acceptance_hints(task: Any, task_hints: Optional[Dict[str, Any]] = None) -> list[str]:
+        """Return compact task-provided checks for orchestration judges."""
+        hints = task_hints if isinstance(task_hints, dict) else {}
+        acceptance_hints: list[str] = []
+        for key in ("validation_hints", "acceptance_hints", "acceptance_criteria", "requirements"):
+            value = hints.get(key)
+            if isinstance(value, str):
+                text = value.strip()
+                if text:
+                    acceptance_hints.append(text)
+            elif isinstance(value, list):
+                for item in value:
+                    text = str(item).strip()
+                    if text:
+                        acceptance_hints.append(text)
+        return acceptance_hints
+
+    def _build_delegation_decision_packet(self, user_message: Any) -> Dict[str, Any]:
+        if isinstance(user_message, str):
+            user_task = user_message
+        else:
+            user_task = _summarize_user_message_for_log(user_message)
+        if len(user_task) > 4000:
+            user_task = user_task[:4000] + "...[truncated]"
+        task_hints = self._orchestration_task_hints()
+        return {
+            "user_task": user_task,
+            "available_tools": sorted(getattr(self, "valid_tool_names", set()) or []),
+            "runtime": {
+                "provider": getattr(self, "provider", "") or "",
+                "model": getattr(self, "model", "") or "",
+            },
+            "cost_latency_policy": self._orchestration_cost_latency_policy(),
+            "task_hints": task_hints,
+            "acceptance_hints": self._orchestration_acceptance_hints(user_task, task_hints),
+        }
+
+    @staticmethod
+    def _compact_delegation_context(delegate_result: Any) -> str:
+        if not isinstance(delegate_result, str):
+            delegate_result = json.dumps(delegate_result, ensure_ascii=False)
+        compact = delegate_result.strip()
+        try:
+            parsed = json.loads(compact)
+            if isinstance(parsed, dict) and isinstance(parsed.get("results"), list):
+                summarized = []
+                for idx, result in enumerate(parsed["results"][:8], start=1):
+                    if not isinstance(result, dict):
+                        summarized.append({"index": idx, "result": result})
+                        continue
+                    summarized.append(
+                        {
+                            "index": idx,
+                            "goal": result.get("goal"),
+                            "status": result.get("status"),
+                            "summary": result.get("summary") or result.get("result") or result.get("error"),
+                        }
+                    )
+                compact = json.dumps(
+                    {
+                        "results": summarized,
+                        "total_duration_seconds": parsed.get("total_duration_seconds"),
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+            else:
+                compact = json.dumps(parsed, ensure_ascii=False, separators=(",", ":"))
+        except Exception:
+            compact = re.sub(r"\s+", " ", compact)
+        if len(compact) > 6000:
+            compact = compact[:6000] + "...[truncated]"
+        return (
+            "<orchestration-delegation-context>\n"
+            "Pre-turn subagent result from delegate_task:\n"
+            f"{compact}\n"
+            "</orchestration-delegation-context>"
+        )
+
+    def _prepare_orchestration_delegation_tasks(
+        self,
+        tasks: list,
+        user_task: str,
+        task_hints: Optional[Dict[str, Any]] = None,
+    ) -> list[Dict[str, Any]]:
+        user_task = str(user_task or "").strip()
+        if len(user_task) > 4000:
+            user_task = user_task[:4000] + "...[truncated]"
+        target_provider, target_model = self._escalation_target_for_hard_task(task_hints or {})
+        guardrail = (
+            "Original user task and constraints:\n"
+            f"{user_task}\n\n"
+            "Automatic pre-turn delegation constraints:\n"
+            "- The parent agent owns final edits and the final response.\n"
+            "- Inspect, run checks, and report findings or patch suggestions unless this delegated goal explicitly asks for implementation.\n"
+            "- Respect all original file-change constraints. Do not add or edit tests/supporting files unless the original task explicitly permits that file.\n"
+            "- If another file seems necessary, report the reason instead of editing it."
+        )
+        acceptance_hints = self._orchestration_acceptance_hints(user_task, task_hints or {})
+        if acceptance_hints:
+            guardrail += "\n\nTask-provided acceptance checks:\n" + "\n".join(f"- {hint}" for hint in acceptance_hints)
+        prepared: list[Dict[str, Any]] = []
+        for task in tasks:
+            if not isinstance(task, dict) or not str(task.get("goal") or "").strip():
+                continue
+            item = dict(task)
+            context = str(item.get("context") or "").strip()
+            item["context"] = f"{context}\n\n{guardrail}" if context else guardrail
+            item.setdefault("acceptance_criteria", user_task)
+            if target_provider and not item.get("provider"):
+                item["provider"] = target_provider
+            if target_model and not item.get("model"):
+                item["model"] = target_model
+            if target_provider or target_model:
+                item["context"] += (
+                    "\n\nConfigured hard-task escalation target is being used for this delegated slice "
+                    "because task_hints indicate high difficulty or elevated verifier risk."
+                )
+            prepared.append(item)
+        return prepared
+
+    def _escalation_target_for_hard_task(self, task_hints: Dict[str, Any]) -> tuple[str, str]:
+        if not self._task_hints_indicate_hard(task_hints):
+            return "", ""
+        cfg = getattr(self, "_orchestration_cfg", {}) or {}
+        escalation_cfg = cfg.get("escalation", {}) if isinstance(cfg, dict) else {}
+        if not isinstance(escalation_cfg, dict) or not _config_truthy(escalation_cfg.get("enabled", False)):
+            return "", ""
+        provider = str(escalation_cfg.get("target_provider") or "").strip()
+        model = str(escalation_cfg.get("target_model") or "").strip()
+        return provider, model
+
+    @staticmethod
+    def _task_hints_indicate_hard(task_hints: Dict[str, Any]) -> bool:
+        if not isinstance(task_hints, dict):
+            return False
+        difficulty = str(task_hints.get("difficulty") or "").strip().lower()
+        if difficulty in {"hard", "challenging", "complex"}:
+            return True
+        risk = str(task_hints.get("risk") or task_hints.get("risk_level") or "").strip().lower()
+        if risk in {"high", "critical", "p0", "p1"}:
+            return True
+        tags = task_hints.get("tags")
+        if isinstance(tags, list):
+            normalized = {str(tag).strip().lower() for tag in tags}
+            return bool(normalized & {"hard", "complex", "high-risk", "critical"})
+        return False
+
+    def _orchestration_validation_enabled(self) -> bool:
+        cfg = getattr(self, "_orchestration_cfg", {}) or {}
+        if not isinstance(cfg, dict) or not _config_truthy(cfg.get("enabled", False)):
+            return False
+        validation_cfg = cfg.get("validation", {})
+        if not isinstance(validation_cfg, dict):
+            return False
+        return _config_truthy(validation_cfg.get("enabled", False))
+
+    @staticmethod
+    def _truncate_orchestration_text(value: Any, limit: int = 4000) -> str:
+        text = str(value or "")
+        text = re.sub(r"\s+", " ", text).strip()
+        if len(text) > limit:
+            return text[:limit] + "...[truncated]"
+        return text
+
+    def _recent_tool_results_for_validation(self, messages: list) -> list[Dict[str, str]]:
+        recent: list[Dict[str, str]] = []
+        for msg in reversed(messages or []):
+            if not isinstance(msg, dict):
+                continue
+            role = msg.get("role")
+            if role == "user":
+                break
+            if role != "tool":
+                continue
+            recent.append(
+                {
+                    "name": str(msg.get("name") or "tool"),
+                    "content": self._truncate_orchestration_text(msg.get("content"), 1200),
+                }
+            )
+            if len(recent) >= 8:
+                break
+        return list(reversed(recent))
+
+    def _git_evidence_for_validation(self) -> Dict[str, Any]:
+        cwd = Path(os.getenv("TERMINAL_CWD") or getattr(self, "session_cwd", None) or os.getcwd())
+        evidence: Dict[str, Any] = {"cwd": str(cwd)}
+        commands = {
+            "status": ["git", "status", "--short"],
+            "diff_stat": ["git", "diff", "--stat", "--", "."],
+            "diff": ["git", "diff", "--", "."],
+        }
+        for key, cmd in commands.items():
+            try:
+                proc = subprocess.run(
+                    cmd,
+                    cwd=str(cwd),
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    timeout=5,
+                )
+                if proc.returncode == 0 and proc.stdout.strip():
+                    evidence[key] = self._truncate_orchestration_text(proc.stdout, 6000 if key == "diff" else 2000)
+            except Exception as exc:
+                if key == "status":
+                    evidence["git_error"] = self._truncate_orchestration_text(exc, 500)
+        if evidence.get("status"):
+            changed = self._changed_file_contents_for_validation(cwd, str(evidence["status"]))
+            if changed:
+                evidence["changed_files"] = changed
+        return evidence
+
+    def _changed_file_contents_for_validation(
+        self,
+        cwd: Path,
+        status: str,
+    ) -> list[Dict[str, str]]:
+        changed: list[Dict[str, str]] = []
+        for line in status.splitlines():
+            if not line.strip() or len(line) < 4:
+                continue
+            rel = line[3:].strip()
+            if " -> " in rel:
+                rel = rel.rsplit(" -> ", 1)[-1].strip()
+            if not rel or rel.endswith("/"):
+                continue
+            path = (cwd / rel).resolve()
+            try:
+                path.relative_to(cwd.resolve())
+            except Exception:
+                continue
+            try:
+                if not path.is_file() or path.stat().st_size > 12000:
+                    continue
+                content = path.read_text(encoding="utf-8")
+            except Exception:
+                continue
+            changed.append(
+                {
+                    "path": rel,
+                    "content": self._truncate_orchestration_text(content, 4000),
+                }
+            )
+            if len(changed) >= 8:
+                break
+        return changed
+
+    def _build_validation_decision_packet(
+        self,
+        original_user_message: Any,
+        final_response: str,
+        messages: list,
+        turn_exit_reason: str,
+        tool_turn_count: int,
+    ) -> Dict[str, Any]:
+        task = _summarize_user_message_for_log(original_user_message)
+        if len(task) > 4000:
+            task = task[:4000] + "...[truncated]"
+        task_hints = self._orchestration_task_hints()
+        return {
+            "task": task,
+            "acceptance_criteria": task,
+            "final_response": self._truncate_orchestration_text(final_response, 3000),
+            "turn": {
+                "exit_reason": turn_exit_reason,
+                "tool_turns": tool_turn_count,
+                "provider": getattr(self, "provider", "") or "",
+                "model": getattr(self, "model", "") or "",
+            },
+            "tool_results": self._recent_tool_results_for_validation(messages),
+            "workspace": self._git_evidence_for_validation(),
+            "task_hints": task_hints,
+            "acceptance_hints": self._orchestration_acceptance_hints(task, task_hints),
+        }
+
+    def _maybe_run_turn_validation(
+        self,
+        original_user_message: Any,
+        final_response: str,
+        messages: list,
+        turn_exit_reason: str,
+        tool_turn_count: int,
+    ) -> Dict[str, Any]:
+        if not self._orchestration_validation_enabled():
+            return {}
+        if getattr(self, "_delegate_depth", 0) > 0:
+            logger.info("orchestration validation skipped for subagent")
+            return {}
+        if not final_response:
+            return {}
+
+        packet = self._build_validation_decision_packet(
+            original_user_message,
+            final_response,
+            messages,
+            turn_exit_reason,
+            tool_turn_count,
+        )
+        logger.info(
+            "orchestration validation decision start: model=%s provider=%s tool_results=%d",
+            packet["turn"]["model"],
+            packet["turn"]["provider"],
+            len(packet["tool_results"]),
+        )
+        decision_envelope = judge_validation(packet)
+        decision = decision_envelope.get("decision") if isinstance(decision_envelope, dict) else None
+        if not isinstance(decision, dict):
+            decision = decision_envelope if isinstance(decision_envelope, dict) else {}
+        logger.info(
+            "orchestration validation decision: verdict=%s repair_needed=%s called=%s model=%s provider=%s",
+            decision.get("verdict"),
+            decision.get("repair_needed"),
+            decision_envelope.get("called") if isinstance(decision_envelope, dict) else None,
+            decision_envelope.get("model") if isinstance(decision_envelope, dict) else None,
+            decision_envelope.get("provider") if isinstance(decision_envelope, dict) else None,
+        )
+        return decision_envelope if isinstance(decision_envelope, dict) else {"decision": decision}
+
+    def _orchestration_escalation_enabled(self) -> bool:
+        cfg = getattr(self, "_orchestration_cfg", {}) or {}
+        if not isinstance(cfg, dict) or not _config_truthy(cfg.get("enabled", False)):
+            return False
+        escalation_cfg = cfg.get("escalation", {})
+        if not isinstance(escalation_cfg, dict):
+            return False
+        if not _config_truthy(escalation_cfg.get("enabled", False)):
+            return False
+        return _config_truthy(escalation_cfg.get("retry_main_turns", True))
+
+    @staticmethod
+    def _decision_from_envelope(envelope: Any) -> Dict[str, Any]:
+        if not isinstance(envelope, dict):
+            return {}
+        decision = envelope.get("decision")
+        return decision if isinstance(decision, dict) else envelope
+
+    def _turn_needs_escalation(
+        self,
+        final_response: str,
+        turn_exit_reason: str,
+        tool_turn_count: int,
+        validation_result: Dict[str, Any],
+    ) -> bool:
+        if not self._orchestration_escalation_enabled():
+            return False
+        if getattr(self, "_delegate_depth", 0) > 0:
+            logger.info("orchestration escalation skipped for subagent")
+            return False
+        if "delegate_task" not in (getattr(self, "valid_tool_names", set()) or set()):
+            logger.info("orchestration escalation skipped: delegate_task tool unavailable")
+            return False
+
+        decision = self._decision_from_envelope(validation_result)
+        verdict = str(decision.get("verdict") or "").strip().lower()
+        if decision.get("repair_needed") is True:
+            return True
+        if verdict in {"fail", "failed"}:
+            return True
+        if verdict == "uncertain":
+            return decision.get("repair_needed") is not False
+        if not final_response:
+            return True
+        reason = str(turn_exit_reason or "").strip().lower()
+        if "max_iteration" in reason or "timeout" in reason:
+            return True
+        max_iterations = getattr(self, "max_iterations", None)
+        if isinstance(max_iterations, int) and max_iterations > 0 and tool_turn_count >= max_iterations:
+            return True
+        return False
+
+    def _build_escalation_failure_packet(
+        self,
+        original_user_message: Any,
+        final_response: str,
+        messages: list,
+        turn_exit_reason: str,
+        tool_turn_count: int,
+        validation_result: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        task = _summarize_user_message_for_log(original_user_message)
+        if len(task) > 4000:
+            task = task[:4000] + "...[truncated]"
+        task_hints = self._orchestration_task_hints()
+        return {
+            "task": task,
+            "attempts": [
+                {
+                    "provider": getattr(self, "provider", "") or "",
+                    "model": getattr(self, "model", "") or "",
+                    "exit_reason": turn_exit_reason,
+                    "tool_turns": tool_turn_count,
+                    "max_iterations": getattr(self, "max_iterations", None),
+                    "final_response": self._truncate_orchestration_text(final_response, 3000),
+                }
+            ],
+            "errors": [],
+            "verifier_result": validation_result if isinstance(validation_result, dict) else {},
+            "timeout_or_limit": {
+                "exit_reason": turn_exit_reason,
+                "tool_turns": tool_turn_count,
+                "max_iterations": getattr(self, "max_iterations", None),
+            },
+            "tool_results": self._recent_tool_results_for_validation(messages),
+            "workspace": self._git_evidence_for_validation(),
+            "task_hints": task_hints,
+            "acceptance_hints": self._orchestration_acceptance_hints(task, task_hints),
+        }
+
+    def _orchestration_escalation_max_retry_rounds(self) -> int:
+        cfg = getattr(self, "_orchestration_cfg", {}) or {}
+        escalation_cfg = cfg.get("escalation", {}) if isinstance(cfg, dict) else {}
+        if not isinstance(escalation_cfg, dict):
+            return 2
+        try:
+            rounds = int(escalation_cfg.get("max_retry_rounds", 2))
+        except (TypeError, ValueError):
+            return 2
+        return max(1, min(rounds, 3))
+
+    def _validation_envelope_needs_repair(self, validation_result: Dict[str, Any]) -> bool:
+        decision = self._decision_from_envelope(validation_result)
+        verdict = str(decision.get("verdict") or "").strip().lower()
+        if decision.get("repair_needed") is True:
+            return True
+        if verdict in {"fail", "failed"}:
+            return True
+        if verdict == "uncertain":
+            return decision.get("repair_needed") is not False
+        return False
+
+    def _maybe_run_post_escalation_validation(
+        self,
+        original_user_message: Any,
+        retry_result: str,
+        messages: list,
+        tool_turn_count: int,
+        prior_validation: Dict[str, Any],
+        round_index: int,
+    ) -> Dict[str, Any]:
+        if not self._orchestration_validation_enabled():
+            return {}
+        packet = self._build_validation_decision_packet(
+            original_user_message,
+            retry_result,
+            messages,
+            "escalation_retry",
+            tool_turn_count,
+        )
+        packet["tool_results"] = [
+            {
+                "name": "escalation_retry_result",
+                "content": self._truncate_orchestration_text(retry_result, 4000),
+            }
+        ]
+        packet["post_escalation"] = {
+            "round": round_index,
+            "prior_validation": prior_validation if isinstance(prior_validation, dict) else {},
+            "retry_result": self._truncate_orchestration_text(retry_result, 4000),
+        }
+        logger.info(
+            "orchestration post-escalation validation decision start: round=%d model=%s provider=%s",
+            round_index,
+            packet["turn"]["model"],
+            packet["turn"]["provider"],
+        )
+        decision_envelope = judge_validation(packet)
+        decision = self._decision_from_envelope(decision_envelope)
+        logger.info(
+            "orchestration post-escalation validation decision: round=%d verdict=%s repair_needed=%s called=%s model=%s provider=%s",
+            round_index,
+            decision.get("verdict"),
+            decision.get("repair_needed"),
+            decision_envelope.get("called") if isinstance(decision_envelope, dict) else None,
+            decision_envelope.get("model") if isinstance(decision_envelope, dict) else None,
+            decision_envelope.get("provider") if isinstance(decision_envelope, dict) else None,
+        )
+        return decision_envelope if isinstance(decision_envelope, dict) else {"decision": decision}
+
+    def _dispatch_escalation_retry(
+        self,
+        failure: Dict[str, Any],
+        decision: Dict[str, Any],
+        escalation_cfg: Dict[str, Any],
+    ) -> str:
+        compact_prompt = str(decision.get("compact_prompt") or "").strip()
+        if not compact_prompt:
+            compact_prompt = (
+                "Repair or complete the failed task using the failure packet in context. "
+                "Keep the change scoped to the original task and report the commands you ran."
+            )
+        configured_provider = str(escalation_cfg.get("target_provider") or "").strip()
+        configured_model = str(escalation_cfg.get("target_model") or "").strip()
+        allow_decision_override = _config_truthy(escalation_cfg.get("allow_decision_model_override", False))
+        decision_provider = str(decision.get("provider") or "").strip()
+        decision_model = str(decision.get("model") or "").strip()
+        if (configured_model or configured_provider) and not allow_decision_override:
+            target_provider = configured_provider or decision_provider
+            target_model = configured_model or decision_model
+        else:
+            target_provider = decision_provider or configured_provider
+            target_model = decision_model or configured_model
+        logger.info(
+            "orchestration escalation retry dispatch target: configured_model=%s configured_provider=%s "
+            "decision_model=%s decision_provider=%s effective_model=%s effective_provider=%s "
+            "allow_decision_override=%s",
+            configured_model or None,
+            configured_provider or None,
+            decision_model or None,
+            decision_provider or None,
+            target_model or None,
+            target_provider or None,
+            allow_decision_override,
+        )
+        dispatch_args: Dict[str, Any] = {
+            "goal": self._truncate_orchestration_text(compact_prompt, 4000),
+            "context": (
+                "Quality escalation retry for the current turn. "
+                "Use this compact failure packet only; do not rely on the parent conversation. "
+                "When the task names an exact Python interpreter path, use that path and do not call bare python. "
+                "Use available Hermes file tools or real shell commands; do not call apply_patch as a terminal command.\n\n"
+                f"{self._truncate_orchestration_text(json.dumps(failure, ensure_ascii=False), 8000)}"
+            ),
+            "acceptance_criteria": failure.get("task", ""),
+            "allow_escalation_retry": False,
+        }
+        if target_provider:
+            dispatch_args["provider"] = target_provider
+        if target_model:
+            dispatch_args["model"] = target_model
+        self._emit_status("Orchestration escalation retry started")
+        try:
+            retry_result = self._dispatch_delegate_task(dispatch_args)
+        except Exception as exc:
+            logger.warning("orchestration escalation retry failed open: %s", exc, exc_info=True)
+            retry_result = json.dumps({"error": str(exc)}, ensure_ascii=False)
+        logger.info("orchestration escalation retry completed: result_chars=%d", len(str(retry_result)))
+        return str(retry_result)
+
+    def _maybe_run_turn_escalation(
+        self,
+        original_user_message: Any,
+        final_response: str,
+        messages: list,
+        turn_exit_reason: str,
+        tool_turn_count: int,
+        validation_result: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        if not self._turn_needs_escalation(
+            final_response,
+            turn_exit_reason,
+            tool_turn_count,
+            validation_result,
+        ):
+            return {}
+
+        cfg = getattr(self, "_orchestration_cfg", {}) or {}
+        escalation_cfg = cfg.get("escalation", {}) if isinstance(cfg, dict) else {}
+        if not isinstance(escalation_cfg, dict):
+            escalation_cfg = {}
+
+        current_response = final_response
+        current_validation = validation_result
+        current_exit_reason = turn_exit_reason
+        rounds: list[Dict[str, Any]] = []
+        last_retry_result = ""
+
+        for round_index in range(1, self._orchestration_escalation_max_retry_rounds() + 1):
+            if round_index > 1 and not self._validation_envelope_needs_repair(current_validation):
+                break
+
+            failure = self._build_escalation_failure_packet(
+                original_user_message,
+                current_response,
+                messages,
+                current_exit_reason,
+                tool_turn_count,
+                current_validation,
+            )
+            failure["escalation_round"] = round_index
+            logger.info(
+                "orchestration escalation decision start: round=%d model=%s provider=%s exit_reason=%s",
+                round_index,
+                failure["attempts"][0]["model"],
+                failure["attempts"][0]["provider"],
+                current_exit_reason,
+            )
+            decision_envelope = decide_escalation(failure)
+            decision = self._decision_from_envelope(decision_envelope)
+            logger.info(
+                "orchestration escalation decision: round=%d escalate=%s called=%s model=%s provider=%s target_model=%s target_provider=%s",
+                round_index,
+                bool(decision.get("escalate")),
+                decision_envelope.get("called") if isinstance(decision_envelope, dict) else None,
+                decision_envelope.get("model") if isinstance(decision_envelope, dict) else None,
+                decision_envelope.get("provider") if isinstance(decision_envelope, dict) else None,
+                decision.get("model"),
+                decision.get("provider"),
+            )
+            if not decision.get("escalate"):
+                if rounds:
+                    result = dict(rounds[-1])
+                    result["rounds"] = rounds
+                    result["retry_result"] = self._truncate_orchestration_text(last_retry_result, 6000)
+                    return result
+                return decision_envelope if isinstance(decision_envelope, dict) else {"decision": decision}
+
+            retry_result = self._dispatch_escalation_retry(failure, decision, escalation_cfg)
+            last_retry_result = retry_result
+            round_record = dict(decision_envelope) if isinstance(decision_envelope, dict) else {"decision": decision}
+            round_record["round"] = round_index
+            round_record["retry_result"] = self._truncate_orchestration_text(retry_result, 6000)
+
+            post_validation = self._maybe_run_post_escalation_validation(
+                original_user_message,
+                retry_result,
+                messages,
+                tool_turn_count,
+                current_validation,
+                round_index,
+            )
+            if post_validation:
+                round_record["post_retry_validation"] = post_validation
+            rounds.append(round_record)
+
+            if not self._validation_envelope_needs_repair(post_validation):
+                break
+
+            logger.info(
+                "orchestration escalation retry still needs repair after round %d",
+                round_index,
+            )
+            current_response = retry_result
+            current_validation = post_validation
+            current_exit_reason = "post_escalation_validation"
+
+        if not rounds:
+            return {}
+        result = dict(rounds[-1])
+        result["rounds"] = rounds
+        result["retry_result"] = self._truncate_orchestration_text(last_retry_result, 6000)
+        return result
+
+    def _maybe_run_pre_turn_delegation(self, user_message: Any) -> str:
+        if not self._orchestration_delegation_enabled():
+            return ""
+        if getattr(self, "_delegate_depth", 0) > 0:
+            logger.info("orchestration delegation skipped for subagent")
+            return ""
+        if "delegate_task" not in (getattr(self, "valid_tool_names", set()) or set()):
+            logger.info("orchestration delegation skipped: delegate_task tool unavailable")
+            return ""
+
+        packet = self._build_delegation_decision_packet(user_message)
+        logger.info(
+            "orchestration delegation decision start: model=%s provider=%s tools=%d",
+            packet["runtime"]["model"],
+            packet["runtime"]["provider"],
+            len(packet["available_tools"]),
+        )
+        try:
+            decision_envelope = decide_delegation(packet)
+        except Exception as exc:
+            logger.warning("orchestration delegation decision failed open: %s", exc, exc_info=True)
+            self._emit_status("Orchestration delegation judge failed - continuing main agent")
+            return ""
+        if not isinstance(decision_envelope, dict):
+            logger.warning("orchestration delegation decision returned non-dict; continuing")
+            return ""
+        decision = decision_envelope.get("decision")
+        if not isinstance(decision, dict):
+            decision = decision_envelope
+        tasks = decision.get("tasks")
+        if not (decision.get("delegate") is True and isinstance(tasks, list) and tasks):
+            logger.info(
+                "orchestration delegation decision: delegate=%s tasks=%d called=%s model=%s provider=%s",
+                bool(decision.get("delegate")),
+                len(tasks) if isinstance(tasks, list) else 0,
+                decision_envelope.get("called"),
+                decision_envelope.get("model"),
+                decision_envelope.get("provider"),
+            )
+            return ""
+
+
+        prepared_tasks = self._prepare_orchestration_delegation_tasks(
+            tasks,
+            packet.get("user_task", ""),
+            packet.get("task_hints", {}),
+        )
+        if not prepared_tasks:
+            logger.info("orchestration delegation decision produced no usable tasks; continuing")
+            return ""
+
+        logger.info("orchestration delegation accepted: tasks=%d", len(prepared_tasks))
+        self._emit_status(f"Orchestration delegated {len(prepared_tasks)} pre-turn task(s)")
+        try:
+            delegate_result = self._dispatch_delegate_task(
+                {
+                    "tasks": prepared_tasks,
+                    "context": (
+                        "Pre-turn orchestration delegation for the current user task. "
+                        "The parent agent owns final edits; subagents must preserve original constraints."
+                    ),
+                    "acceptance_criteria": packet.get("user_task", ""),
+                }
+            )
+        except Exception as exc:
+            logger.warning("orchestration pre-turn delegate_task failed open: %s", exc, exc_info=True)
+            self._emit_status("Orchestration delegation failed - continuing main agent")
+            return ""
+
+        logger.info("orchestration delegation completed: result_chars=%d", len(str(delegate_result)))
+        return self._compact_delegation_context(delegate_result)
 
 
     def _handle_max_iterations(self, messages: list, api_call_count: int) -> str:
@@ -12510,6 +13606,8 @@ class AIAgent:
         except Exception as exc:
             logger.warning("pre_llm_call hook failed: %s", exc)
 
+        _orchestration_user_context = self._maybe_run_pre_turn_delegation(original_user_message)
+
         # Main conversation loop
         api_call_count = 0
         final_response = None
@@ -12528,6 +13626,11 @@ class AIAgent:
         # present are surfaced in an advisory footer so the model cannot
         # over-claim success while the file is actually unchanged on disk.
         self._turn_failed_file_mutations: Dict[str, Dict[str, Any]] = {}
+        self._post_success_changed_paths: set[str] = set()
+        self._post_success_allowed_mutation_paths: set[str] = set()
+        self._post_success_mutation_guard_seen = False
+        self._post_success_mutation_history_unknown = False
+        self._post_success_mutation_block_count = 0
         
         # Record the execution thread so interrupt()/clear_interrupt() can
         # scope the tool-level interrupt signal to THIS agent's thread only.
@@ -12743,6 +13846,8 @@ class AIAgent:
                             _injections.append(_fenced)
                     if _plugin_user_context:
                         _injections.append(_plugin_user_context)
+                    if _orchestration_user_context:
+                        _injections.append(_orchestration_user_context)
                     if _injections:
                         _base = api_msg.get("content", "")
                         if isinstance(_base, str):
@@ -15836,6 +16941,38 @@ class AIAgent:
         # list of parts; the trajectory format wants a plain string.
         self._save_trajectory(messages, _summarize_user_message_for_log(user_message), completed)
 
+        _validation_tool_turn_count = sum(
+            1 for m in messages
+            if isinstance(m, dict) and m.get("role") == "assistant" and m.get("tool_calls")
+        )
+        orchestration_validation = {}
+        if final_response and not interrupted:
+            try:
+                orchestration_validation = self._maybe_run_turn_validation(
+                    original_user_message,
+                    final_response,
+                    messages,
+                    _turn_exit_reason,
+                    _validation_tool_turn_count,
+                )
+            except Exception as exc:
+                logger.warning("orchestration validation failed open: %s", exc, exc_info=True)
+                orchestration_validation = {"error": str(exc)}
+        orchestration_escalation = {}
+        if not interrupted:
+            try:
+                orchestration_escalation = self._maybe_run_turn_escalation(
+                    original_user_message,
+                    final_response or "",
+                    messages,
+                    _turn_exit_reason,
+                    _validation_tool_turn_count,
+                    orchestration_validation,
+                )
+            except Exception as exc:
+                logger.warning("orchestration escalation failed open: %s", exc, exc_info=True)
+                orchestration_escalation = {"error": str(exc)}
+
         # Clean up VM and browser for this task after conversation completes
         self._cleanup_task_resources(effective_task_id)
 
@@ -15999,6 +17136,10 @@ class AIAgent:
             "cost_status": self.session_cost_status,
             "cost_source": self.session_cost_source,
         }
+        if orchestration_validation:
+            result["orchestration_validation"] = orchestration_validation
+        if orchestration_escalation:
+            result["orchestration_escalation"] = orchestration_escalation
         if self._tool_guardrail_halt_decision is not None:
             result["guardrail"] = self._tool_guardrail_halt_decision.to_metadata()
         # If a /steer landed after the final assistant turn (no more tool
