@@ -47,6 +47,7 @@ from agent.tool_guardrails import (
     ToolCallGuardrailController,
     ToolGuardrailDecision,
 )
+from agent.tool_result_reducer import ToolResultReducer
 from hermes_cli.config import cfg_get
 from hermes_cli.timeouts import get_provider_request_timeout
 from hermes_constants import get_hermes_home
@@ -948,6 +949,8 @@ def init_agent(
     agent._kanban_worker_guidance = (
         KANBAN_GUIDANCE if "kanban_show" in agent.valid_tool_names else ""
     )
+
+    agent._tool_result_reducer = ToolResultReducer()
 
     # Check tool requirements
     if agent.tools and not agent.quiet_mode:

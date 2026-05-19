@@ -388,6 +388,26 @@ compression:
   # auxiliary section below (auxiliary.compression.provider / model).
 
 # =============================================================================
+# Context Tool Result Reduction
+# =============================================================================
+# Optional pre-prompt reduction for very large tool outputs. Disabled by default.
+# When enabled, Hermes asks an auxiliary model to extract task-relevant findings
+# before the tool result is appended to active conversation context.
+#
+context:
+  engine: "compressor"
+  tool_result_reduction:
+    enabled: false
+    min_chars: 4000
+    model: null              # Optional model override; provider comes from auxiliary.tool_result_reduction
+    preserve_raw_reference: true
+    max_reduced_chars: 4000
+    include_tool_args: true
+    include_recent_user_intent: true
+    excluded_tools: []
+    included_tools: ["*"]
+
+# =============================================================================
 # Anthropic prompt caching TTL
 # =============================================================================
 # When prompt caching is active (Claude via OpenRouter or native Anthropic),
@@ -457,6 +477,12 @@ prompt_caching:
 #                           # reasoning controls:
 #                           # extra_body:
 #                           #   enable_thinking: false
+#
+#   # Tool result reduction — summarizes large tool outputs before prompt insertion
+#   tool_result_reduction:
+#     provider: "auto"
+#     model: ""
+#     timeout: 30
 
 # =============================================================================
 # Persistent Memory

@@ -119,6 +119,45 @@ def _build_persisted_message(
     return msg
 
 
+def _safe_reference_id(tool_use_id: str) -> str:
+    """Return a filesystem-safe identifier for persisted tool artifacts."""
+    safe = "".join(
+        ch if ch.isalnum() or ch in "._-" else "_"
+        for ch in str(tool_use_id or "")
+    ).strip("._-")
+    return safe[:80] or uuid.uuid4().hex[:12]
+
+
+def persist_tool_result_reference(
+    content: str,
+    tool_name: str,
+    tool_use_id: str,
+    env=None,
+) -> str | None:
+    """Persist a raw tool result and return only its path.
+
+    Unlike ``maybe_persist_tool_result()``, this helper does not create an
+    inline preview. It is used by the tool-result reducer so active model
+    context can contain a compact summary plus a recoverable reference without
+    also carrying a large raw-output preview.
+    """
+    if env is None:
+        return None
+
+    storage_dir = _resolve_storage_dir(env)
+    remote_path = f"{storage_dir}/{_safe_reference_id(tool_use_id)}.raw.txt"
+    try:
+        if _write_to_sandbox(content, remote_path, env):
+            logger.info(
+                "Persisted raw tool result reference: %s (%s, %d chars -> %s)",
+                tool_name, tool_use_id, len(content), remote_path,
+            )
+            return remote_path
+    except Exception as exc:
+        logger.debug("Raw tool-result reference write failed for %s: %s", tool_use_id, exc)
+    return None
+
+
 def maybe_persist_tool_result(
     content: str,
     tool_name: str,

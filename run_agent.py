@@ -151,6 +151,31 @@ from agent.prompt_builder import (  # noqa: F401  # re-exported via _ra() / mock
     load_soul_md,
 )
 from agent.process_bootstrap import _get_proxy_from_env  # noqa: F401
+from agent.display import (
+    KawaiiSpinner, build_tool_preview as _build_tool_preview,
+    get_cute_tool_message as _get_cute_tool_message_impl,
+    _detect_tool_failure,
+    get_tool_emoji as _get_tool_emoji,
+)
+from agent.tool_guardrails import (
+    ToolCallGuardrailConfig,
+    ToolCallGuardrailController,
+    ToolGuardrailDecision,
+    append_toolguard_guidance,
+    toolguard_synthetic_result,
+)
+from agent.tool_result_classification import (
+    FILE_MUTATING_TOOL_NAMES as _FILE_MUTATING_TOOLS,
+    file_mutation_result_landed,
+)
+from agent.tool_result_reducer import (
+    ToolResultReducer,
+    recent_user_intent_from_messages,
+)
+from agent.trajectory import (
+    convert_scratchpad_to_think,
+    save_trajectory as _save_trajectory_to_file,
+)
 from agent.message_sanitization import (  # noqa: F401
     _SURROGATE_RE,
     _sanitize_surrogates,
@@ -4399,6 +4424,33 @@ class AIAgent:
             self.model,
         )
         return summary
+
+    def _reduce_tool_result_for_context(
+        self,
+        *,
+        tool_name: str,
+        tool_args: Dict[str, Any],
+        result: Any,
+        tool_call_id: str | None,
+        effective_task_id: str,
+        messages: list,
+    ) -> Any:
+        """Reduce large text results before they enter model-visible history."""
+        if _is_multimodal_tool_result(result) or not isinstance(result, str):
+            return result
+        try:
+            return self._tool_result_reducer.reduce(
+                tool_name=tool_name,
+                tool_args=tool_args,
+                result=result,
+                tool_call_id=tool_call_id,
+                task_id=effective_task_id,
+                recent_user_intent=recent_user_intent_from_messages(messages),
+                env=get_active_env(effective_task_id),
+            )
+        except Exception as exc:
+            logger.debug("tool-result reduction failed open for %s: %s", tool_name, exc)
+            return result
 
     def _try_shrink_image_parts_in_messages(self, api_messages: list) -> bool:
         """Forwarder — see ``agent.conversation_compression.try_shrink_image_parts_in_messages``."""

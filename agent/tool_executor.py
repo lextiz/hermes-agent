@@ -720,6 +720,15 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             except Exception as cb_err:
                 logging.debug(f"Tool complete callback error: {cb_err}")
 
+        function_result = agent._reduce_tool_result_for_context(
+            tool_name=name,
+            tool_args=args,
+            result=function_result,
+            tool_call_id=tc.id,
+            effective_task_id=effective_task_id,
+            messages=messages,
+        )
+
         function_result = maybe_persist_tool_result(
             content=function_result,
             tool_name=name,
@@ -1338,6 +1347,15 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 agent.tool_complete_callback(tool_call.id, function_name, function_args, function_result)
             except Exception as cb_err:
                 logging.debug(f"Tool complete callback error: {cb_err}")
+
+        function_result = agent._reduce_tool_result_for_context(
+            tool_name=function_name,
+            tool_args=function_args,
+            result=function_result,
+            tool_call_id=tool_call.id,
+            effective_task_id=effective_task_id,
+            messages=messages,
+        )
 
         function_result = maybe_persist_tool_result(
             content=function_result,

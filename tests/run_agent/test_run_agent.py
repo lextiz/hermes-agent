@@ -2488,6 +2488,21 @@ class TestConcurrentToolExecution:
         assert starts == [("c1", "web_search", {"query": "hello"})]
         assert completes == [("c1", "web_search", {"query": "hello"}, '{"success": true}')]
 
+    def test_sequential_reduces_result_before_context_append(self, agent):
+        tool_call = _mock_tool_call(name="web_search", arguments='{"query":"hello"}', call_id="c1")
+        mock_msg = _mock_assistant_msg(content="", tool_calls=[tool_call])
+        messages = [{"role": "user", "content": "Find the relevant search result."}]
+        agent._tool_result_reducer.reduce = MagicMock(return_value="REDUCED RESULT")
+
+        with patch("run_agent.handle_function_call", return_value="RAW RESULT"):
+            agent._execute_tool_calls_sequential(mock_msg, messages, "task-1")
+
+        assert messages[-1]["content"] == "REDUCED RESULT"
+        agent._tool_result_reducer.reduce.assert_called_once()
+        assert agent._tool_result_reducer.reduce.call_args.kwargs["recent_user_intent"] == (
+            "Find the relevant search result."
+        )
+
     def test_concurrent_tool_callbacks_fire_for_each_tool(self, agent):
         tc1 = _mock_tool_call(name="web_search", arguments='{"query":"one"}', call_id="c1")
         tc2 = _mock_tool_call(name="web_search", arguments='{"query":"two"}', call_id="c2")

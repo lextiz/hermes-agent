@@ -729,6 +729,36 @@ Plugin engines are **never auto-activated** — you must explicitly set `context
 
 See [Memory Providers](/user-guide/features/memory-providers) for the analogous single-select system for memory plugins.
 
+### Tool Result Reduction
+
+Large tool results can be reduced before they are appended to active model context. This is separate from context compression: it runs at the tool-result boundary, after tool execution and existing terminal redaction/truncation, and before the next model call sees the result.
+
+The feature is disabled by default.
+
+```yaml
+context:
+  tool_result_reduction:
+    enabled: false
+    min_chars: 4000
+    model: null
+    preserve_raw_reference: true
+    max_reduced_chars: 4000
+    include_tool_args: true
+    include_recent_user_intent: true
+    excluded_tools: []
+    included_tools: ["*"]
+
+auxiliary:
+  tool_result_reduction:
+    provider: "auto"
+    model: ""
+    timeout: 30
+```
+
+`context.tool_result_reduction.model` is a simple model override for the reducer call. Use `auxiliary.tool_result_reduction` when you need to pin a provider, custom endpoint, API key, timeout, or provider-specific `extra_body`.
+
+When `preserve_raw_reference` is true, Hermes stores a raw-output reference when the active backend exposes the existing tool-result storage path. Non-environment tools may not have a recoverable raw reference yet; in that case the reduced result explicitly says the raw reference is unavailable.
+
 ## Iteration Budget Pressure
 
 When the agent is working on a complex task with many tool calls, it can burn through its iteration budget (default: 90 turns) without realizing it's running low. Budget pressure automatically warns the model as it approaches the limit:

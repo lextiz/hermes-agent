@@ -1240,6 +1240,14 @@ DEFAULT_CONFIG = {
             "timeout": 120,        # seconds — compression summarises large contexts; increase for local models
             "extra_body": {},
         },
+        "tool_result_reduction": {
+            "provider": "auto",
+            "model": "",
+            "base_url": "",
+            "api_key": "",
+            "timeout": 30,         # seconds - reduce one large tool result before prompt insertion
+            "extra_body": {},
+        },
         # Note: session_search no longer uses an auxiliary LLM (PR #27590 —
         # single-shape tool returns DB content directly). The old
         # ``auxiliary.session_search.*`` block was removed here. Existing
@@ -1633,6 +1641,17 @@ DEFAULT_CONFIG = {
     # a plugin in plugins/context_engine/<name>/ or ~/.hermes/plugins/.
     "context": {
         "engine": "compressor",
+        "tool_result_reduction": {
+            "enabled": False,
+            "min_chars": 4_000,
+            "model": None,
+            "preserve_raw_reference": True,
+            "max_reduced_chars": 4_000,
+            "include_tool_args": True,
+            "include_recent_user_intent": True,
+            "excluded_tools": [],
+            "included_tools": ["*"],
+        },
     },
 
     # Persistent memory -- bounded curated memory injected into system prompt
