@@ -409,6 +409,7 @@ class AIAgent:
         checkpoint_max_total_size_mb: int = 500,
         checkpoint_max_file_size_mb: int = 10,
         pass_session_id: bool = False,
+        topic_guard_force_callback: callable = None,
     ):
         """Forwarder — see ``agent.agent_init.init_agent``."""
         from agent.agent_init import init_agent
@@ -481,6 +482,7 @@ class AIAgent:
             checkpoint_max_total_size_mb=checkpoint_max_total_size_mb,
             checkpoint_max_file_size_mb=checkpoint_max_file_size_mb,
             pass_session_id=pass_session_id,
+            topic_guard_force_callback=topic_guard_force_callback,
         )
 
     def _get_session_db_for_recall(self):
@@ -1026,6 +1028,90 @@ class AIAgent:
             "api_mode": getattr(self, "api_mode", "") or "",
         }
 
+    def _topic_guard_session_title(self) -> str:
+        if not self._session_db or not self.session_id:
+            return ""
+        try:
+            title = self._session_db.get_session_title(self.session_id)
+        except Exception:
+            return ""
+        return str(title or "")
+
+    def _topic_guard_force_new_session(self, classification: Any) -> bool:
+        """Start a fresh child session for topic-guard force mode."""
+        if not self._session_db or not self.session_id:
+            logger.info("topic guard force unsupported: no session DB")
+            return False
+
+        old_session_id = self.session_id
+        self.session_start = datetime.now()
+        new_session_id = f"{self.session_start.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
+        try:
+            self._session_db.end_session(old_session_id, "topic_guard")
+        except Exception:
+            logger.debug("topic guard could not mark old session ended", exc_info=True)
+
+        self.session_id = new_session_id
+        self._parent_session_id = old_session_id
+        self._session_db_created = False
+        self._last_flushed_db_idx = 0
+        self._pending_db_session = True
+        self._cached_system_prompt = None
+        self.reset_session_state()
+
+        os.environ["HERMES_SESSION_ID"] = self.session_id
+        try:
+            from gateway.session_context import _SESSION_ID
+            _SESSION_ID.set(self.session_id)
+        except Exception:
+            pass
+        try:
+            from hermes_logging import set_session_context
+            set_session_context(self.session_id)
+        except Exception:
+            pass
+        try:
+            self._ensure_db_session()
+        except Exception:
+            logger.debug("topic guard session DB creation deferred", exc_info=True)
+
+        old_topic = getattr(classification, "old_topic", "") or "previous topic"
+        new_topic = getattr(classification, "new_topic", "") or "new topic"
+        logger.info(
+            "topic guard forced new session: old=%s new=%s old_topic=%r new_topic=%r",
+            old_session_id,
+            self.session_id,
+            old_topic,
+            new_topic,
+        )
+        return True
+
+    def _maybe_apply_topic_guard(
+        self,
+        user_message: Any,
+        conversation_history: Optional[List[Dict[str, Any]]],
+    ) -> bool:
+        """Run the optional pre-turn topic guard."""
+        guard = getattr(self, "_topic_guard", None)
+        if guard is None:
+            return False
+        try:
+            decision = guard.evaluate(
+                user_message=user_message,
+                conversation_history=list(conversation_history or []),
+                session_title=self._topic_guard_session_title(),
+            )
+        except Exception as exc:
+            logger.warning("topic guard failed open: %s", exc, exc_info=True)
+            return False
+        if not decision.fired:
+            return False
+        if decision.advisory:
+            self._emit_status(decision.advisory)
+        if decision.force_fallback:
+            logger.info("topic guard force mode fell back to suggest")
+        return bool(decision.started_new_session)
+
     def _check_compression_model_feasibility(self) -> None:
         """Forwarder — see ``agent.conversation_compression.check_compression_model_feasibility``."""
         from agent.conversation_compression import check_compression_model_feasibility
@@ -1415,6 +1501,10 @@ class AIAgent:
         here so existing tests that patch ``run_agent.threading.Thread``
         keep working.
         """
+        if os.environ.get("HERMES_DISABLE_BACKGROUND_REVIEW") == "1":
+            logger.info("background review skipped by configuration")
+            return
+
         from agent.background_review import spawn_background_review_thread
         target, _prompt = spawn_background_review_thread(
             self,

@@ -32,6 +32,7 @@ from tools.delegate_tool import (
     _strip_blocked_tools,
     _resolve_child_credential_pool,
     _resolve_delegation_credentials,
+    _resolve_task_delegation_credentials,
 )
 
 
@@ -69,6 +70,13 @@ class TestDelegateRequirements(unittest.TestCase):
         self.assertIn("tasks", props)
         self.assertIn("context", props)
         self.assertIn("toolsets", props)
+        self.assertIn("model", props)
+        self.assertIn("provider", props)
+        task_props = props["tasks"]["items"]["properties"]
+        self.assertIn("model", task_props)
+        self.assertIn("provider", task_props)
+        self.assertIn("Model-only", props["model"]["description"])
+        self.assertIn("re-resolve", props["provider"]["description"])
         # max_iterations is intentionally NOT exposed to the model — it's
         # config-authoritative via delegation.max_iterations so users get
         # predictable budgets.
@@ -1160,6 +1168,67 @@ class TestDelegationCredentialResolution(unittest.TestCase):
         cfg = {"model": "some-model", "provider": "crof.ai"}
         creds = _resolve_delegation_credentials(cfg, parent)
         self.assertIsNone(creds["provider"])
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    def test_task_model_override_keeps_surrounding_credential_bundle(self, mock_resolve):
+        parent = _make_mock_parent(depth=0)
+        cfg = {
+            "model": "config-model",
+            "provider": "config-provider",
+            "base_url": "https://configured.example/v1",
+            "api_key": "configured-key",
+        }
+        mock_resolve.return_value = {
+            "model": "task-model",
+            "provider": "custom",
+            "base_url": "https://configured.example/v1",
+            "api_key": "configured-key",
+            "api_mode": "chat_completions",
+        }
+
+        _resolve_task_delegation_credentials(
+            cfg,
+            parent,
+            top_level_model="top-model",
+            task_model="task-model",
+        )
+
+        resolved_cfg = mock_resolve.call_args.args[0]
+        self.assertEqual(resolved_cfg["model"], "task-model")
+        self.assertEqual(resolved_cfg["provider"], "config-provider")
+        self.assertEqual(resolved_cfg["base_url"], "https://configured.example/v1")
+        self.assertEqual(resolved_cfg["api_key"], "configured-key")
+
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    def test_provider_override_re_resolves_without_stale_direct_credentials(self, mock_resolve):
+        parent = _make_mock_parent(depth=0)
+        cfg = {
+            "model": "config-model",
+            "provider": "old-provider",
+            "base_url": "https://old.example/v1",
+            "api_key": "old-key",
+        }
+        mock_resolve.return_value = {
+            "model": "task-model",
+            "provider": "new-provider",
+            "base_url": "https://new.example/v1",
+            "api_key": "new-key",
+            "api_mode": "chat_completions",
+        }
+
+        _resolve_task_delegation_credentials(
+            cfg,
+            parent,
+            top_level_model="top-model",
+            top_level_provider="top-provider",
+            task_model="task-model",
+            task_provider="new-provider",
+        )
+
+        resolved_cfg = mock_resolve.call_args.args[0]
+        self.assertEqual(resolved_cfg["model"], "task-model")
+        self.assertEqual(resolved_cfg["provider"], "new-provider")
+        self.assertNotIn("base_url", resolved_cfg)
+        self.assertNotIn("api_key", resolved_cfg)
 
 
 class TestDelegationProviderIntegration(unittest.TestCase):
@@ -1398,6 +1467,64 @@ class TestDelegationProviderIntegration(unittest.TestCase):
 
     @patch("tools.delegate_tool._load_config")
     @patch("tools.delegate_tool._resolve_delegation_credentials")
+    def test_per_task_routing_overrides_build_child_arguments(self, mock_creds, mock_cfg):
+        mock_cfg.return_value = {
+            "max_iterations": 45,
+            "model": "config-model",
+            "provider": "config-provider",
+        }
+
+        def resolve(cfg, parent_agent):
+            provider = cfg.get("provider")
+            model = cfg.get("model")
+            return {
+                "model": model,
+                "provider": provider,
+                "base_url": f"https://{provider}.example/v1",
+                "api_key": f"{provider}-key",
+                "api_mode": "chat_completions",
+            }
+
+        mock_creds.side_effect = resolve
+        parent = _make_mock_parent(depth=0)
+
+        with patch("tools.delegate_tool._build_child_agent") as mock_build, \
+             patch("tools.delegate_tool._run_single_child") as mock_run:
+            mock_child = MagicMock()
+            mock_build.return_value = mock_child
+            mock_run.return_value = {
+                "task_index": 0,
+                "status": "completed",
+                "summary": "Done",
+                "api_calls": 1,
+                "duration_seconds": 1.0,
+            }
+
+            delegate_task(
+                tasks=[
+                    {"goal": "uses top-level routing"},
+                    {
+                        "goal": "uses task routing",
+                        "model": "task-model",
+                        "provider": "task-provider",
+                    },
+                ],
+                model="top-model",
+                provider="top-provider",
+                parent_agent=parent,
+            )
+
+        first = mock_build.call_args_list[0].kwargs
+        second = mock_build.call_args_list[1].kwargs
+        self.assertEqual(first["model"], "top-model")
+        self.assertEqual(first["override_provider"], "top-provider")
+        self.assertEqual(first["override_base_url"], "https://top-provider.example/v1")
+        self.assertEqual(second["model"], "task-model")
+        self.assertEqual(second["override_provider"], "task-provider")
+        self.assertEqual(second["override_base_url"], "https://task-provider.example/v1")
+
+    @patch("tools.delegate_tool._load_config")
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
     def test_delegation_acp_runtime_reaches_child_agent(self, mock_creds, mock_cfg):
         """Resolved ACP runtime command/args must be forwarded to child agents."""
         mock_cfg.return_value = {
@@ -1469,6 +1596,258 @@ class TestDelegationProviderIntegration(unittest.TestCase):
             self.assertEqual(kwargs["provider"], parent.provider)
             self.assertEqual(kwargs["base_url"], parent.base_url)
 
+    @patch("tools.delegate_tool._load_config")
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    def test_per_call_model_provider_override_reaches_child(self, mock_creds, mock_cfg):
+        """Escalation callers can route a single child to a configured target."""
+        mock_cfg.return_value = {
+            "max_iterations": 45,
+            "model": "gpt-5.4-mini",
+            "provider": "openai",
+        }
+        mock_creds.return_value = {
+            "model": "gpt-5.5",
+            "provider": "openai",
+            "base_url": "https://api.openai.com/v1",
+            "api_key": "sk-test",
+            "api_mode": "codex_responses",
+        }
+        parent = _make_mock_parent(depth=0)
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.run_conversation.return_value = {
+                "final_response": "done", "completed": True, "api_calls": 1
+            }
+            MockAgent.return_value = mock_child
+
+            delegate_task(
+                goal="Escalated retry",
+                model="gpt-5.5",
+                provider="openai",
+                parent_agent=parent,
+            )
+
+            _, kwargs = MockAgent.call_args
+            self.assertEqual(kwargs["model"], "gpt-5.5")
+            self.assertEqual(kwargs["provider"], "openai")
+            self.assertEqual(kwargs["base_url"], "https://api.openai.com/v1")
+            self.assertEqual(kwargs["api_mode"], "codex_responses")
+            mock_creds.assert_called_once()
+            resolve_cfg = mock_creds.call_args.args[0]
+            self.assertEqual(resolve_cfg["model"], "gpt-5.5")
+            self.assertEqual(resolve_cfg["provider"], "openai")
+
+
+class TestDelegationValidationAndEscalation(unittest.TestCase):
+    @patch("agent.orchestration_decisions.judge_validation")
+    @patch("tools.delegate_tool._run_single_child")
+    def test_acceptance_criteria_adds_validation_result(self, mock_run, mock_judge):
+        mock_run.return_value = {
+            "task_index": 0,
+            "status": "completed",
+            "summary": "Implemented the feature",
+            "api_calls": 1,
+            "duration_seconds": 1.0,
+        }
+        mock_judge.return_value = {
+            "enabled": True,
+            "called": True,
+            "kind": "validation",
+            "decision": {
+                "verdict": "pass",
+                "missing_checks": [],
+                "suggested_commands": [],
+                "repair_needed": False,
+                "reason": "criteria met",
+            },
+            "provider": "auto",
+            "model": "judge",
+        }
+        parent = _make_mock_parent()
+
+        result = json.loads(
+            delegate_task(
+                goal="Implement feature",
+                acceptance_criteria="Tests pass and summary explains changes",
+                parent_agent=parent,
+            )
+        )
+
+        entry = result["results"][0]
+        self.assertEqual(entry["validation"]["decision"]["verdict"], "pass")
+        packet = mock_judge.call_args.args[0]
+        self.assertEqual(packet["acceptance_criteria"], "Tests pass and summary explains changes")
+        self.assertEqual(packet["task"], "Implement feature")
+
+    @patch("agent.orchestration_decisions.decide_escalation")
+    @patch("tools.delegate_tool._run_single_child")
+    @patch("tools.delegate_tool._build_child_agent")
+    def test_failed_child_can_retry_with_escalation_target(self, mock_build, mock_run, mock_escalate):
+        mock_child = MagicMock()
+        mock_build.return_value = mock_child
+        mock_run.side_effect = [
+            {
+                "task_index": 0,
+                "status": "error",
+                "summary": None,
+                "error": "local model failed",
+                "api_calls": 1,
+                "duration_seconds": 1.0,
+                "_child_role": "leaf",
+            },
+            {
+                "task_index": 0,
+                "status": "completed",
+                "summary": "Fixed by stronger model",
+                "api_calls": 2,
+                "duration_seconds": 2.0,
+                "model": "gpt-strong",
+                "exit_reason": "completed",
+                "_child_role": "leaf",
+                "_child_cost_usd": 0.01,
+            },
+        ]
+        mock_escalate.return_value = {
+            "enabled": True,
+            "called": True,
+            "kind": "escalation",
+            "decision": {
+                "escalate": True,
+                "model": "gpt-strong",
+                "provider": None,
+                "compact_prompt": "Repair only the failed slice",
+                "retry_strategy": "retry_once",
+                "reason": "initial attempt failed",
+            },
+        }
+        parent = _make_mock_parent()
+
+        result = json.loads(delegate_task(goal="Hard task", parent_agent=parent))
+
+        entry = result["results"][0]
+        self.assertEqual(entry["status"], "completed")
+        self.assertEqual(entry["summary"], "Fixed by stronger model")
+        self.assertIn("pre_escalation_result", entry)
+        self.assertEqual(entry["escalation"]["retry_result"]["model"], "gpt-strong")
+        self.assertEqual(mock_build.call_args_list[-1].kwargs["model"], "gpt-strong")
+
+    @patch("agent.orchestration_decisions.decide_escalation")
+    @patch("tools.delegate_tool._run_single_child")
+    @patch("tools.delegate_tool._build_child_agent")
+    @patch("tools.delegate_tool._orchestration_kind_config")
+    @patch("tools.delegate_tool._resolve_task_delegation_credentials")
+    def test_configured_escalation_target_overrides_judge_suggestion(
+        self, mock_creds, mock_kind_cfg, mock_build, mock_run, mock_escalate
+    ):
+        mock_kind_cfg.return_value = {
+            "retry_delegated_tasks": True,
+            "target_provider": "openai",
+            "target_model": "gpt-5.5",
+        }
+        mock_creds.return_value = {
+            "model": "gpt-5.5",
+            "provider": "openai",
+            "base_url": "https://api.openai.com/v1",
+            "api_key": "sk-test",
+            "api_mode": "codex_responses",
+        }
+        mock_child = MagicMock()
+        mock_build.return_value = mock_child
+        mock_run.side_effect = [
+            {
+                "task_index": 0,
+                "status": "error",
+                "summary": None,
+                "error": "local model failed",
+                "api_calls": 1,
+                "duration_seconds": 1.0,
+                "_child_role": "leaf",
+            },
+            {
+                "task_index": 0,
+                "status": "completed",
+                "summary": "Fixed by configured target",
+                "api_calls": 1,
+                "duration_seconds": 1.0,
+                "model": "gpt-5.5",
+                "_child_role": "leaf",
+            },
+        ]
+        mock_escalate.return_value = {
+            "enabled": True,
+            "called": True,
+            "kind": "escalation",
+            "decision": {
+                "escalate": True,
+                "model": "gpt-5.4-mini",
+                "provider": "openai",
+                "compact_prompt": "Repair only the failed slice",
+            },
+        }
+        parent = _make_mock_parent()
+
+        result = json.loads(delegate_task(goal="Hard task", parent_agent=parent))
+
+        entry = result["results"][0]
+        self.assertEqual(entry["status"], "completed")
+        self.assertEqual(entry["escalation"]["retry_result"]["model"], "gpt-5.5")
+        mock_creds.assert_called_with(
+            unittest.mock.ANY,
+            parent,
+            task_model="gpt-5.5",
+            task_provider="openai",
+        )
+        retry_context = mock_build.call_args_list[-1].kwargs["context"]
+        self.assertIn("do not call apply_patch as a terminal command", retry_context)
+
+    @patch("agent.orchestration_decisions.decide_escalation")
+    @patch("agent.orchestration_decisions.judge_validation")
+    @patch("tools.delegate_tool._run_single_child")
+    @patch("tools.delegate_tool._build_child_agent")
+    def test_allow_escalation_retry_false_validates_without_nested_retry(
+        self, mock_build, mock_run, mock_judge, mock_escalate
+    ):
+        mock_child = MagicMock()
+        mock_build.return_value = mock_child
+        mock_run.return_value = {
+            "task_index": 0,
+            "status": "completed",
+            "summary": "Still missing hidden edge evidence",
+            "api_calls": 1,
+            "duration_seconds": 1.0,
+            "_child_role": "leaf",
+        }
+        mock_judge.return_value = {
+            "enabled": True,
+            "called": True,
+            "kind": "validation",
+            "decision": {
+                "verdict": "uncertain",
+                "repair_needed": True,
+                "missing_checks": ["zero-count hunk evidence"],
+            },
+            "provider": "openai",
+            "model": "judge",
+        }
+        parent = _make_mock_parent()
+
+        result = json.loads(
+            delegate_task(
+                goal="Escalation retry worker",
+                acceptance_criteria="Apply the requested file changes correctly",
+                allow_escalation_retry=False,
+                parent_agent=parent,
+            )
+        )
+
+        entry = result["results"][0]
+        self.assertEqual(entry["validation"]["decision"]["verdict"], "uncertain")
+        self.assertEqual(
+            entry["escalation"]["retry_skipped"],
+            "delegated escalation retry disabled by caller",
+        )
+        mock_escalate.assert_not_called()
 
 class TestChildCredentialPoolResolution(unittest.TestCase):
     def test_same_provider_shares_parent_pool(self):

@@ -41,9 +41,11 @@ def test_default_config_is_soft_warning_only_with_hard_stop_disabled():
     assert cfg.exact_failure_warn_after == 2
     assert cfg.same_tool_failure_warn_after == 3
     assert cfg.no_progress_warn_after == 2
+    assert cfg.same_idempotent_tool_warn_after == 8
     assert cfg.exact_failure_block_after == 5
     assert cfg.same_tool_failure_halt_after == 8
     assert cfg.no_progress_block_after == 5
+    assert cfg.same_idempotent_tool_halt_after == 16
 
 
 def test_config_parses_nested_warn_and_hard_stop_thresholds():
@@ -55,11 +57,13 @@ def test_config_parses_nested_warn_and_hard_stop_thresholds():
                 "exact_failure": 3,
                 "same_tool_failure": 4,
                 "idempotent_no_progress": 5,
+                "idempotent_tool_streak": 9,
             },
             "hard_stop_after": {
                 "exact_failure": 6,
                 "same_tool_failure": 7,
                 "idempotent_no_progress": 8,
+                "idempotent_tool_streak": 10,
             },
         }
     )
@@ -69,9 +73,11 @@ def test_config_parses_nested_warn_and_hard_stop_thresholds():
     assert cfg.exact_failure_warn_after == 3
     assert cfg.same_tool_failure_warn_after == 4
     assert cfg.no_progress_warn_after == 5
+    assert cfg.same_idempotent_tool_warn_after == 9
     assert cfg.exact_failure_block_after == 6
     assert cfg.same_tool_failure_halt_after == 7
     assert cfg.no_progress_block_after == 8
+    assert cfg.same_idempotent_tool_halt_after == 10
 
 
 def test_default_repeated_identical_failed_call_warns_without_blocking():
@@ -226,6 +232,113 @@ def test_hard_stop_enabled_blocks_idempotent_no_progress_future_repeat():
     blocked = controller.before_call("read_file", args)
     assert blocked.action == "block"
     assert blocked.code == "idempotent_no_progress_block"
+
+
+def test_hard_stop_blocks_repeated_read_only_terminal_no_progress():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(
+            hard_stop_enabled=True,
+            no_progress_warn_after=2,
+            no_progress_block_after=2,
+        )
+    )
+    args = {"command": "ls -F"}
+    result = '{"exit_code":0,"output":"jsonpatcher.py\ntest_jsonpatcher.py\n"}'
+
+    assert controller.before_call("terminal", args).action == "allow"
+    assert controller.after_call("terminal", args, result, failed=False).action == "allow"
+    assert controller.before_call("terminal", args).action == "allow"
+    assert controller.after_call("terminal", args, result, failed=False).action == "warn"
+
+    blocked = controller.before_call("terminal", args)
+    assert blocked.action == "block"
+    assert blocked.code == "idempotent_no_progress_block"
+
+
+def test_same_idempotent_tool_success_streak_warns_without_blocking_by_default():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(
+            same_idempotent_tool_warn_after=3,
+            same_idempotent_tool_halt_after=3,
+        )
+    )
+
+    decisions = []
+    for i in range(4):
+        args = {"query": f"symbol {i}"}
+        assert controller.before_call("session_search", args).action == "allow"
+        decisions.append(
+            controller.after_call(
+                "session_search",
+                args,
+                f"distinct evidence {i}",
+                failed=False,
+            )
+        )
+
+    assert [decision.action for decision in decisions] == ["allow", "allow", "warn", "warn"]
+    assert {decision.code for decision in decisions[2:]} == {"same_idempotent_tool_streak_warning"}
+    assert controller.before_call("session_search", {"query": "symbol 5"}).action == "allow"
+    assert controller.halt_decision is None
+
+
+def test_hard_stop_enabled_halts_same_idempotent_tool_success_streak():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(
+            hard_stop_enabled=True,
+            same_idempotent_tool_warn_after=2,
+            same_idempotent_tool_halt_after=3,
+        )
+    )
+
+    assert controller.before_call("session_search", {"query": "symbol 1"}).action == "allow"
+    first = controller.after_call("session_search", {"query": "symbol 1"}, "evidence 1", failed=False)
+    assert first.action == "allow"
+
+    assert controller.before_call("session_search", {"query": "symbol 2"}).action == "allow"
+    second = controller.after_call("session_search", {"query": "symbol 2"}, "evidence 2", failed=False)
+    assert second.action == "warn"
+    assert second.code == "same_idempotent_tool_streak_warning"
+
+    assert controller.before_call("session_search", {"query": "symbol 3"}).action == "allow"
+    third = controller.after_call("session_search", {"query": "symbol 3"}, "evidence 3", failed=False)
+    assert third.action == "halt"
+    assert third.code == "same_idempotent_tool_streak_halt"
+
+    blocked = controller.before_call("session_search", {"query": "symbol 4"})
+    assert blocked.action == "block"
+    assert blocked.code == "same_idempotent_tool_streak_block"
+
+
+def test_mutating_tool_resets_idempotent_tool_success_streak():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(same_idempotent_tool_warn_after=3)
+    )
+
+    assert controller.after_call("session_search", {"query": "a"}, "evidence a", failed=False).action == "allow"
+    assert controller.after_call("session_search", {"query": "b"}, "evidence b", failed=False).action == "allow"
+    assert controller.after_call("write_file", {"path": "/tmp/x", "content": "x"}, "ok", failed=False).action == "allow"
+
+    assert controller.after_call("session_search", {"query": "c"}, "evidence c", failed=False).action == "allow"
+    assert controller.after_call("session_search", {"query": "d"}, "evidence d", failed=False).action == "allow"
+
+
+def test_mutating_terminal_commands_are_not_read_only_no_progress_candidates():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(
+            hard_stop_enabled=True,
+            no_progress_warn_after=2,
+            no_progress_block_after=2,
+        )
+    )
+    result = '{"exit_code":0,"output":""}'
+
+    for command in ["rm -f sample.txt", "ls -F | cat"]:
+        args = {"command": command}
+        for _ in range(3):
+            assert controller.before_call("terminal", args).action == "allow"
+            assert controller.after_call("terminal", args, result, failed=False).action == "allow"
+        assert controller.before_call("terminal", args).action == "allow"
 
 
 def test_mutating_or_unknown_tools_are_not_blocked_for_repeated_identical_success_output_by_default():

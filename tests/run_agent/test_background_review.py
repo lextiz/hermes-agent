@@ -40,6 +40,28 @@ class ImmediateThread:
         self._target()
 
 
+def test_background_review_can_be_disabled_by_configuration(monkeypatch):
+    events = []
+
+    class FakeReviewAgent:
+        def __init__(self, **kwargs):
+            events.append(("init", kwargs))
+
+    monkeypatch.setattr(run_agent_module, "AIAgent", FakeReviewAgent)
+    monkeypatch.setattr(run_agent_module.threading, "Thread", ImmediateThread)
+    monkeypatch.setenv("HERMES_DISABLE_BACKGROUND_REVIEW", "1")
+
+    agent = _bare_agent()
+
+    AIAgent._spawn_background_review(
+        agent,
+        messages_snapshot=[{"role": "user", "content": "hello"}],
+        review_skills=True,
+    )
+
+    assert events == []
+
+
 def test_background_review_shuts_down_memory_provider_before_close(monkeypatch):
     events = []
 

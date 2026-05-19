@@ -394,7 +394,6 @@ GOOGLE_MODEL_OPERATIONAL_GUIDANCE = (
     "Don't stop with a plan — execute it.\n"
 )
 
-
 # Guidance injected into the system prompt when the computer_use toolset
 # is active. Universal — works for any model (Claude, GPT, open models).
 COMPUTER_USE_GUIDANCE = (
@@ -1279,16 +1278,16 @@ def build_skills_system_prompt(
 
         result = (
             "## Skills (mandatory)\n"
-            "Before replying, scan the skills below. If a skill matches or is even partially relevant "
-            "to your task, you MUST load it with skill_view(name) and follow its instructions. "
-            "Err on the side of loading — it is always better to have context you don't need "
-            "than to miss critical steps, pitfalls, or established workflows. "
+            "Before replying, scan the skills below. Load a skill with skill_view(name) "
+            "only when it is clearly relevant to the user's task or explicitly requested, "
+            "then follow its instructions. Prefer one skill. Load two only when the task "
+            "genuinely spans two domains, and load more than two only when the user request "
+            "or workflow truly requires it. "
             "Skills contain specialized knowledge — API endpoints, tool-specific commands, "
-            "and proven workflows that outperform general-purpose approaches. Load the skill "
-            "even if you think you could handle the task with basic tools like web_search or terminal. "
-            "Skills also encode the user's preferred approach, conventions, and quality standards "
-            "for tasks like code review, planning, and testing — load them even for tasks you "
-            "already know how to do, because the skill defines how it should be done here.\n"
+            "and proven workflows that outperform general-purpose approaches. Use them when "
+            "that specialized context will materially improve correctness, safety, or fit. "
+            "Do not load skills just for extra background on routine tasks that direct tools "
+            "can handle cleanly.\n"
             "Whenever the user asks you to configure, set up, install, enable, disable, modify, "
             "or troubleshoot Hermes Agent itself — its CLI, config, models, providers, tools, "
             "skills, voice, gateway, plugins, or any feature — load the `hermes-agent` skill "
@@ -1303,7 +1302,7 @@ def build_skills_system_prompt(
             + "\n".join(index_lines) + "\n"
             "</available_skills>\n"
             "\n"
-            "Only proceed without loading a skill if genuinely none are relevant to the task."
+            "Proceed without loading a skill when none are clearly relevant or requested."
         )
 
     # ── Store in LRU cache ────────────────────────────────────────────

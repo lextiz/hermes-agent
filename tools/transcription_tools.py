@@ -1069,6 +1069,7 @@ _CUDA_LIB_ERROR_MARKERS = (
     "no kernel image is available",
     "no CUDA-capable device",
     "CUDA driver version is insufficient",
+    "cuBLAS",
 )
 
 

@@ -166,6 +166,26 @@ model:
 # worktree: false   # Default — only create when -w flag is passed
 
 # =============================================================================
+# Session Topic Guard (optional)
+# =============================================================================
+# Detect clear topic changes before an agent turn runs. Disabled by default.
+# Suggest mode shows an advisory and lets the turn continue. Force mode is
+# opt-in; entry points that cannot safely start/switch sessions fall back to
+# suggest mode.
+#
+# session:
+#   topic_guard:
+#     enabled: true
+#     mode: suggest        # off | suggest | force
+#     model: null          # defaults to the auxiliary topic_guard model/provider
+#     min_turns: 4
+#     confidence_threshold: 0.75
+#     cooldown_turns: 3
+#     max_summary_chars: 2000
+#     ignore_slash_commands: true
+#     ignore_short_messages_chars: 40
+
+# =============================================================================
 # Terminal Tool Configuration
 # =============================================================================
 # Choose ONE of the following terminal configurations by uncommenting it.

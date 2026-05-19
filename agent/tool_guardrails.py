@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 
@@ -59,6 +60,23 @@ MUTATING_TOOL_NAMES = frozenset(
     }
 )
 
+_READ_ONLY_TERMINAL_RE = re.compile(
+    r"^\s*(?:"
+    r"pwd(?:\s|$)"
+    r"|ls(?:\s|$)"
+    r"|find(?:\s|$)"
+    r"|cat(?:\s|$)"
+    r"|head(?:\s|$)"
+    r"|tail(?:\s|$)"
+    r"|grep(?:\s|$)"
+    r"|rg(?:\s|$)"
+    r"|sed\s+-n(?:\s|$)"
+    r"|git\s+(?:status|diff|show|log|ls-files)(?:\s|$)"
+    r")"
+)
+
+_TERMINAL_CONTROL_TOKENS = (";", "&&", "||", "|", ">", "<", "`", "$(")
+
 
 @dataclass(frozen=True)
 class ToolCallGuardrailConfig:
@@ -77,6 +95,8 @@ class ToolCallGuardrailConfig:
     same_tool_failure_halt_after: int = 8
     no_progress_warn_after: int = 2
     no_progress_block_after: int = 5
+    same_idempotent_tool_warn_after: int = 8
+    same_idempotent_tool_halt_after: int = 16
     idempotent_tools: frozenset[str] = field(default_factory=lambda: IDEMPOTENT_TOOL_NAMES)
     mutating_tools: frozenset[str] = field(default_factory=lambda: MUTATING_TOOL_NAMES)
 
@@ -109,6 +129,10 @@ class ToolCallGuardrailConfig:
                 warn_after.get("idempotent_no_progress", data.get("no_progress_warn_after")),
                 defaults.no_progress_warn_after,
             ),
+            same_idempotent_tool_warn_after=_positive_int(
+                warn_after.get("idempotent_tool_streak", data.get("same_idempotent_tool_warn_after")),
+                defaults.same_idempotent_tool_warn_after,
+            ),
             exact_failure_block_after=_positive_int(
                 hard_stop_after.get("exact_failure", data.get("exact_failure_block_after")),
                 defaults.exact_failure_block_after,
@@ -120,6 +144,10 @@ class ToolCallGuardrailConfig:
             no_progress_block_after=_positive_int(
                 hard_stop_after.get("idempotent_no_progress", data.get("no_progress_block_after")),
                 defaults.no_progress_block_after,
+            ),
+            same_idempotent_tool_halt_after=_positive_int(
+                hard_stop_after.get("idempotent_tool_streak", data.get("same_idempotent_tool_halt_after")),
+                defaults.same_idempotent_tool_halt_after,
             ),
         )
 
@@ -232,6 +260,7 @@ class ToolCallGuardrailController:
         self._exact_failure_counts: dict[ToolCallSignature, int] = {}
         self._same_tool_failure_counts: dict[str, int] = {}
         self._no_progress: dict[ToolCallSignature, tuple[str, int]] = {}
+        self._idempotent_tool_success_streak: tuple[str, int] | None = None
         self._halt_decision: ToolGuardrailDecision | None = None
 
     @property
@@ -239,7 +268,8 @@ class ToolCallGuardrailController:
         return self._halt_decision
 
     def before_call(self, tool_name: str, args: Mapping[str, Any] | None) -> ToolGuardrailDecision:
-        signature = ToolCallSignature.from_call(tool_name, _coerce_args(args))
+        args = _coerce_args(args)
+        signature = ToolCallSignature.from_call(tool_name, args)
         if not self.config.hard_stop_enabled:
             return ToolGuardrailDecision(tool_name=tool_name, signature=signature)
 
@@ -260,7 +290,7 @@ class ToolCallGuardrailController:
             self._halt_decision = decision
             return decision
 
-        if self._is_idempotent(tool_name):
+        if self._is_idempotent_call(tool_name, args):
             record = self._no_progress.get(signature)
             if record is not None:
                 _result_hash, repeat_count = record
@@ -279,6 +309,23 @@ class ToolCallGuardrailController:
                     )
                     self._halt_decision = decision
                     return decision
+
+            streak = self._idempotent_tool_success_streak
+            if streak is not None and streak[0] == tool_name and streak[1] >= self.config.same_idempotent_tool_halt_after:
+                decision = ToolGuardrailDecision(
+                    action="block",
+                    code="same_idempotent_tool_streak_block",
+                    message=(
+                        f"Blocked {tool_name}: this read-only tool was called "
+                        f"{streak[1]} consecutive times without an intervening write, "
+                        "test, or other action. Use the gathered evidence or change strategy."
+                    ),
+                    tool_name=tool_name,
+                    count=streak[1],
+                    signature=signature,
+                )
+                self._halt_decision = decision
+                return decision
 
         return ToolGuardrailDecision(tool_name=tool_name, signature=signature)
 
@@ -299,6 +346,7 @@ class ToolCallGuardrailController:
             exact_count = self._exact_failure_counts.get(signature, 0) + 1
             self._exact_failure_counts[signature] = exact_count
             self._no_progress.pop(signature, None)
+            self._idempotent_tool_success_streak = None
 
             same_count = self._same_tool_failure_counts.get(tool_name, 0) + 1
             self._same_tool_failure_counts[tool_name] = same_count
@@ -347,9 +395,17 @@ class ToolCallGuardrailController:
         self._exact_failure_counts.pop(signature, None)
         self._same_tool_failure_counts.pop(tool_name, None)
 
-        if not self._is_idempotent(tool_name):
+        if not self._is_idempotent_call(tool_name, args):
             self._no_progress.pop(signature, None)
+            self._idempotent_tool_success_streak = None
             return ToolGuardrailDecision(tool_name=tool_name, signature=signature)
+
+        streak_count = 1
+        if self._idempotent_tool_success_streak is not None:
+            streak_tool, previous_count = self._idempotent_tool_success_streak
+            if streak_tool == tool_name:
+                streak_count = previous_count + 1
+        self._idempotent_tool_success_streak = (tool_name, streak_count)
 
         result_hash = _result_hash(result)
         previous = self._no_progress.get(signature)
@@ -372,9 +428,41 @@ class ToolCallGuardrailController:
                 signature=signature,
             )
 
+        if self.config.hard_stop_enabled and streak_count >= self.config.same_idempotent_tool_halt_after:
+            decision = ToolGuardrailDecision(
+                action="halt",
+                code="same_idempotent_tool_streak_halt",
+                message=(
+                    f"Stopped {tool_name}: this read-only tool was called "
+                    f"{streak_count} consecutive times without an intervening write, "
+                    "test, or other action. Use the gathered evidence or change strategy."
+                ),
+                tool_name=tool_name,
+                count=streak_count,
+                signature=signature,
+            )
+            self._halt_decision = decision
+            return decision
+
+        if self.config.warnings_enabled and streak_count >= self.config.same_idempotent_tool_warn_after:
+            return ToolGuardrailDecision(
+                action="warn",
+                code="same_idempotent_tool_streak_warning",
+                message=(
+                    f"{tool_name} has been called {streak_count} consecutive times "
+                    "without an intervening write, test, or other action. Use the "
+                    "evidence already gathered or change strategy before more searching."
+                ),
+                tool_name=tool_name,
+                count=streak_count,
+                signature=signature,
+            )
+
         return ToolGuardrailDecision(tool_name=tool_name, count=repeat_count, signature=signature)
 
-    def _is_idempotent(self, tool_name: str) -> bool:
+    def _is_idempotent_call(self, tool_name: str, args: Mapping[str, Any]) -> bool:
+        if tool_name == "terminal":
+            return _terminal_command_is_read_only(args)
         if tool_name in self.config.mutating_tools:
             return False
         return tool_name in self.config.idempotent_tools
@@ -425,6 +513,20 @@ def _tool_failure_recovery_hint(tool_name: str, count: int) -> str:
 
 def _coerce_args(args: Mapping[str, Any] | None) -> Mapping[str, Any]:
     return args if isinstance(args, Mapping) else {}
+
+
+def _terminal_command_is_read_only(args: Mapping[str, Any]) -> bool:
+    command = args.get("command")
+    if not isinstance(command, str):
+        command = args.get("cmd")
+    if not isinstance(command, str):
+        return False
+    stripped = command.strip()
+    if not stripped:
+        return False
+    if any(token in stripped for token in _TERMINAL_CONTROL_TOKENS):
+        return False
+    return bool(_READ_ONLY_TERMINAL_RE.match(stripped))
 
 
 def _result_hash(result: str | None) -> str:

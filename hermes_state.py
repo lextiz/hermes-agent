@@ -441,6 +441,7 @@ class SessionDB:
             self._conn.row_factory = sqlite3.Row
             apply_wal_with_fallback(self._conn, db_label="state.db")
             self._conn.execute("PRAGMA foreign_keys=ON")
+            self._conn.execute("PRAGMA recursive_triggers=ON")
 
             self._init_schema()
         except Exception as exc:
@@ -900,6 +901,18 @@ class SessionDB:
                     )
                 except sqlite3.OperationalError:
                     pass
+
+            if current_version < 12 and fts5_available:
+                # v12: heal FTS/index drift. Recent-session search failures can
+                # happen when old processes wrote messages while FTS triggers
+                # were missing/stale or a migration dropped/recreated the FTS
+                # tables while another writer was active. Compare message rowids
+                # against both FTS tables and rebuild when they diverge.
+                _fts_in_sync = self._fts_indexes_in_sync(cursor)
+                if not _fts_in_sync:
+                    self._rebuild_fts_indexes(cursor)
+
+
             if current_version < SCHEMA_VERSION and fts_migrations_complete:
                 cursor.execute(
                     "UPDATE schema_version SET version = ?",
@@ -932,7 +945,91 @@ class SessionDB:
                 if trigram_enabled and triggers_need_repair:
                     self._rebuild_fts_indexes(cursor)
 
+        # Defensive startup health check: schema_version-gated migrations only
+        # run once, but state.db may be touched by older long-lived processes or
+        # restored from partial backups. If recent_sessions shows rows that FTS
+        # cannot find, this catches and repairs the drift automatically.
+        if not self._fts_indexes_in_sync(cursor):
+            self._rebuild_fts_indexes(cursor)
+
         self._conn.commit()
+
+    def _fts_indexes_in_sync(self, cursor: sqlite3.Cursor) -> bool:
+        """Return True when every message row has both FTS index rows."""
+        try:
+            missing_unicode = cursor.execute(
+                """
+                SELECT 1
+                FROM messages m
+                LEFT JOIN messages_fts f ON f.rowid = m.id
+                WHERE f.rowid IS NULL
+                LIMIT 1
+                """
+            ).fetchone()
+            missing_trigram = cursor.execute(
+                """
+                SELECT 1
+                FROM messages m
+                LEFT JOIN messages_fts_trigram f ON f.rowid = m.id
+                WHERE f.rowid IS NULL
+                LIMIT 1
+                """
+            ).fetchone()
+            orphan_unicode = cursor.execute(
+                """
+                SELECT 1
+                FROM messages_fts f
+                LEFT JOIN messages m ON m.id = f.rowid
+                WHERE m.id IS NULL
+                LIMIT 1
+                """
+            ).fetchone()
+            orphan_trigram = cursor.execute(
+                """
+                SELECT 1
+                FROM messages_fts_trigram f
+                LEFT JOIN messages m ON m.id = f.rowid
+                WHERE m.id IS NULL
+                LIMIT 1
+                """
+            ).fetchone()
+            return not (missing_unicode or missing_trigram or orphan_unicode or orphan_trigram)
+        except sqlite3.OperationalError as exc:
+            logger.warning("FTS index health check failed; forcing rebuild: %s", exc)
+            return False
+
+    def _rebuild_fts_indexes(self, cursor: sqlite3.Cursor) -> None:
+        """Recreate both FTS5 tables/triggers and backfill all messages."""
+        logger.warning("Rebuilding state.db message FTS indexes")
+        for _trig in (
+            "messages_fts_insert",
+            "messages_fts_delete",
+            "messages_fts_update",
+            "messages_fts_trigram_insert",
+            "messages_fts_trigram_delete",
+            "messages_fts_trigram_update",
+        ):
+            cursor.execute(f"DROP TRIGGER IF EXISTS {_trig}")
+        for _tbl in ("messages_fts", "messages_fts_trigram"):
+            cursor.execute(f"DROP TABLE IF EXISTS {_tbl}")
+        cursor.executescript(FTS_SQL)
+        cursor.executescript(FTS_TRIGRAM_SQL)
+        cursor.execute(
+            "INSERT INTO messages_fts(rowid, content) "
+            "SELECT id, "
+            "COALESCE(content, '') || ' ' || "
+            "COALESCE(tool_name, '') || ' ' || "
+            "COALESCE(tool_calls, '') "
+            "FROM messages"
+        )
+        cursor.execute(
+            "INSERT INTO messages_fts_trigram(rowid, content) "
+            "SELECT id, "
+            "COALESCE(content, '') || ' ' || "
+            "COALESCE(tool_name, '') || ' ' || "
+            "COALESCE(tool_calls, '') "
+            "FROM messages"
+        )
 
     # =========================================================================
     # Session lifecycle

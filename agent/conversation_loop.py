@@ -508,6 +508,13 @@ def run_conversation(
         _msg_preview,
     )
 
+    _topic_guard_message = persist_user_message if persist_user_message is not None else user_message
+    if agent._maybe_apply_topic_guard(_topic_guard_message, conversation_history):
+        conversation_history = []
+        agent._user_turn_count = 0
+        agent._turns_since_memory = 0
+        set_session_context(agent.session_id)
+
     # Initialize conversation (copy to avoid mutating the caller's list)
     messages = list(conversation_history) if conversation_history else []
 

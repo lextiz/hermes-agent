@@ -220,6 +220,7 @@ def init_agent(
     checkpoint_max_total_size_mb: int = 500,
     checkpoint_max_file_size_mb: int = 10,
     pass_session_id: bool = False,
+    topic_guard_force_callback: callable = None,
 ):
     """
     Initialize the AI Agent.
@@ -429,6 +430,7 @@ def init_agent(
     agent._executing_tools = False
     agent._tool_guardrails = ToolCallGuardrailController()
     agent._tool_guardrail_halt_decision: ToolGuardrailDecision | None = None
+    agent._topic_guard = None
 
     # Interrupt mechanism for breaking out of tool loops
     agent._interrupt_requested = False
@@ -1094,6 +1096,15 @@ def init_agent(
         )
     except Exception as _tlg_err:
         _ra().logger.warning("Tool loop guardrail config ignored: %s", _tlg_err)
+    try:
+        from agent.topic_guard import TopicGuard, TopicGuardConfig
+        agent._topic_guard = TopicGuard(
+            TopicGuardConfig.from_config(_agent_cfg),
+            force_new_session=topic_guard_force_callback or agent._topic_guard_force_new_session,
+            main_runtime_provider=agent._current_main_runtime,
+        )
+    except Exception as _topic_guard_err:
+        _ra().logger.warning("Topic guard config ignored: %s", _topic_guard_err)
     # Cache only the derived auxiliary compression context override that is
     # needed later by the startup feasibility check.  Avoid exposing a
     # broad pseudo-public config object on the agent instance.

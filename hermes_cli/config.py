@@ -1108,11 +1108,32 @@ DEFAULT_CONFIG = {
             "exact_failure": 2,
             "same_tool_failure": 3,
             "idempotent_no_progress": 2,
+            "idempotent_tool_streak": 8,
         },
         "hard_stop_after": {
             "exact_failure": 5,
             "same_tool_failure": 8,
             "idempotent_no_progress": 5,
+            "idempotent_tool_streak": 16,
+        },
+    },
+
+    "session": {
+        # Optional topic drift guard. Disabled by default so existing session
+        # behavior is unchanged. When enabled, suggest mode emits a concise
+        # advisory and lets the turn continue; force mode is opt-in and falls
+        # back to suggest on entry points that cannot safely create/switch
+        # sessions before the turn runs.
+        "topic_guard": {
+            "enabled": False,
+            "mode": "suggest",  # off | suggest | force
+            "model": None,
+            "min_turns": 4,
+            "confidence_threshold": 0.75,
+            "cooldown_turns": 3,
+            "max_summary_chars": 2000,
+            "ignore_slash_commands": True,
+            "ignore_short_messages_chars": 40,
         },
     },
 
@@ -1286,6 +1307,14 @@ DEFAULT_CONFIG = {
             "timeout": 30,
             "extra_body": {},
         },
+        "topic_guard": {
+            "provider": "auto",
+            "model": "",
+            "base_url": "",
+            "api_key": "",
+            "timeout": 30,
+            "extra_body": {},
+        },
         # Triage specifier — flesh out a rough one-liner in the Kanban
         # Triage column into a concrete spec, then promote it to ``todo``.
         # Invoked by ``hermes kanban specify`` (single id or --all). Set a
@@ -1336,6 +1365,62 @@ DEFAULT_CONFIG = {
             "api_key": "",
             "timeout": 600,
             "extra_body": {},
+        },
+        "orchestration_delegate": {
+            "provider": "auto",
+            "model": "",
+            "base_url": "",
+            "api_key": "",
+            "timeout": 30,
+            "extra_body": {},
+        },
+        "orchestration_validation": {
+            "provider": "auto",
+            "model": "",
+            "base_url": "",
+            "api_key": "",
+            "timeout": 30,
+            "extra_body": {},
+        },
+        "orchestration_escalation": {
+            "provider": "auto",
+            "model": "",
+            "base_url": "",
+            "api_key": "",
+            "timeout": 30,
+            "extra_body": {},
+        },
+    },
+
+    # Compact orchestration decision calls for delegation / validation /
+    # escalation. Disabled by default and fail-open so normal agent behavior
+    # is unchanged unless a caller explicitly opts in.
+    "orchestration": {
+        "enabled": False,
+        "cost_latency_policy": {},
+        "delegation": {
+            "enabled": False,
+            "max_tokens": 500,
+            "timeout": 30,
+            "policy": {},
+        },
+        "validation": {
+            "enabled": False,
+            "max_tokens": 500,
+            "timeout": 30,
+            "validate_without_criteria": False,
+            "freeze_after_successful_check": False,
+        },
+        "escalation": {
+            "enabled": False,
+            "max_tokens": 700,
+            "timeout": 45,
+            "retry_delegated_tasks": True,
+            "retry_main_turns": True,
+            "max_retry_rounds": 2,
+            "target_provider": "",
+            "target_model": "",
+            "target_profile": "",
         },
     },
     
