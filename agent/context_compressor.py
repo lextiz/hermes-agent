@@ -248,6 +248,21 @@ def _content_length_for_budget(raw_content: Any) -> int:
     return total
 
 
+def _message_tokens_for_budget(msg: Dict[str, Any]) -> int:
+    """Rough token estimate for a single message in tail-budget decisions."""
+    raw_content = msg.get("content") or ""
+    msg_tokens = _content_length_for_budget(raw_content) // _CHARS_PER_TOKEN + 10
+    for tc in msg.get("tool_calls") or []:
+        args = ""
+        if isinstance(tc, dict):
+            args = tc.get("function", {}).get("arguments", "")
+        else:
+            fn = getattr(tc, "function", None)
+            args = getattr(fn, "arguments", "") if fn else ""
+        msg_tokens += len(args or "") // _CHARS_PER_TOKEN
+    return msg_tokens
+
+
 def _content_text_for_contains(content: Any) -> str:
     """Return a best-effort text view of message content.
 
@@ -890,14 +905,7 @@ class ContextCompressor(ContextEngine):
             boundary = len(result)
             min_protect = min(protect_tail_count, len(result))
             for i in range(len(result) - 1, -1, -1):
-                msg = result[i]
-                raw_content = msg.get("content") or ""
-                content_len = _content_length_for_budget(raw_content)
-                msg_tokens = content_len // _CHARS_PER_TOKEN + 10
-                for tc in msg.get("tool_calls") or []:
-                    if isinstance(tc, dict):
-                        args = tc.get("function", {}).get("arguments", "")
-                        msg_tokens += len(args) // _CHARS_PER_TOKEN
+                msg_tokens = _message_tokens_for_budget(result[i])
                 if accumulated + msg_tokens > protect_tail_tokens and (len(result) - i) >= min_protect:
                     boundary = i
                     break
@@ -1003,6 +1011,49 @@ class ContextCompressor(ContextEngine):
                 new_tcs.append(tc)
             if modified:
                 result[i] = {**msg, "tool_calls": new_tcs}
+
+        # Pass 4: If the protected tail itself is too large, summarize
+        # oversized tool results inside that tail.  The tail is protected so
+        # the active task is preserved structurally, but a 50KB grep/read_file
+        # result can otherwise survive every compression pass verbatim and
+        # keep the next provider request above the context limit.
+        if protect_tail_tokens is not None and protect_tail_tokens > 0:
+            tail_start = max(0, prune_boundary)
+            soft_ceiling = int(protect_tail_tokens * 1.5)
+            tail_tokens = sum(_message_tokens_for_budget(m) for m in result[tail_start:])
+
+            if tail_tokens > soft_ceiling:
+                candidates: list[tuple[int, int]] = []
+                for i in range(tail_start, len(result)):
+                    msg = result[i]
+                    if msg.get("role") != "tool":
+                        continue
+                    content = msg.get("content", "")
+                    if not isinstance(content, str):
+                        continue
+                    if (
+                        not content
+                        or content == _PRUNED_TOOL_PLACEHOLDER
+                        or content.startswith("[Duplicate tool output")
+                        or len(content) <= 200
+                    ):
+                        continue
+                    candidates.append((len(content), i))
+
+                # Prune the largest protected results first.  This usually
+                # fixes the budget with one or two summaries while preserving
+                # as much recent detail as possible.
+                for _, i in sorted(candidates, reverse=True):
+                    if tail_tokens <= soft_ceiling:
+                        break
+                    msg = result[i]
+                    old_tokens = _message_tokens_for_budget(msg)
+                    call_id = msg.get("tool_call_id", "")
+                    tool_name, tool_args = call_id_to_tool.get(call_id, ("unknown", ""))
+                    summary = _summarize_tool_result(tool_name, tool_args, msg.get("content", ""))
+                    result[i] = {**msg, "content": summary}
+                    tail_tokens += _message_tokens_for_budget(result[i]) - old_tokens
+                    pruned += 1
 
         return result, pruned
 
@@ -2054,15 +2105,7 @@ This compaction should PRIORITISE preserving all information related to the focu
         cut_idx = n  # start from beyond the end
 
         for i in range(n - 1, head_end - 1, -1):
-            msg = messages[i]
-            raw_content = msg.get("content") or ""
-            content_len = _content_length_for_budget(raw_content)
-            msg_tokens = content_len // _CHARS_PER_TOKEN + 10  # +10 for role/metadata
-            # Include tool call arguments in estimate
-            for tc in msg.get("tool_calls") or []:
-                if isinstance(tc, dict):
-                    args = tc.get("function", {}).get("arguments", "")
-                    msg_tokens += len(args) // _CHARS_PER_TOKEN
+            msg_tokens = _message_tokens_for_budget(messages[i])
             # Stop once we exceed the soft ceiling (unless we haven't hit min_tail yet)
             if accumulated + msg_tokens > soft_ceiling and (n - i) >= min_tail:
                 break

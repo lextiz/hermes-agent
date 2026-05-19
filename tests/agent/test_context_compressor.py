@@ -1900,6 +1900,65 @@ class TestTokenBudgetTailProtection:
         # At least one old tool result should have been pruned
         assert pruned >= 1
 
+    def test_prune_oversized_tool_results_inside_protected_tail(self, budget_compressor):
+        """Huge recent tool outputs should not survive solely because of the
+        protected-message floor.
+        """
+        c = budget_compressor
+        messages = [
+            {"role": "user", "content": "current task"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": "call_terminal",
+                    "type": "function",
+                    "function": {
+                        "name": "terminal",
+                        "arguments": '{"command": "grep -R context ~/.hermes"}',
+                    },
+                }],
+            },
+            {
+                "role": "tool",
+                "content": '{"output": "' + ("x" * 20_000) + '", "exit_code": 0}',
+                "tool_call_id": "call_terminal",
+            },
+            {"role": "assistant", "content": "checking another file"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": "call_read",
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": '{"path": "/tmp/large.log", "offset": 1}',
+                    },
+                }],
+            },
+            {
+                "role": "tool",
+                "content": "y" * 20_000,
+                "tool_call_id": "call_read",
+            },
+            {"role": "user", "content": "continue from here"},
+            {"role": "assistant", "content": "working"},
+        ]
+
+        result, pruned = c._prune_old_tool_results(
+            messages,
+            protect_tail_count=len(messages),  # message floor protects all turns
+            protect_tail_tokens=1_000,
+        )
+
+        assert pruned >= 2
+        assert result[2]["content"].startswith("[terminal] ran `grep -R context ~/.hermes`")
+        assert result[5]["content"].startswith("[read_file] read /tmp/large.log")
+        assert len(result[2]["content"]) < 200
+        assert len(result[5]["content"]) < 200
+        assert result[6]["content"] == "continue from here"
+
     def test_prune_short_conv_protects_entire_tail(self, budget_compressor):
         """Regression guard for PR #17025.
 
