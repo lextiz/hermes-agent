@@ -808,6 +808,32 @@ context:
   engine: "lcm"          # must match the plugin's name
 ```
 
+### Experimental branch-aware compression
+
+`branch_compressor` is an opt-in experimental engine for long exploratory agent
+sessions. It keeps the default compressor's protected system/head context and
+recent tail behavior, but groups the compacted middle into attempt branches
+before summarization. Branches that produced facts, code, files, commands, or
+decisions are summarized separately. Failed branches are preserved as short
+negative findings so the model remembers what not to retry without carrying raw
+failed logs in active context.
+
+```yaml
+context:
+  engine: "branch_compressor"
+  branch_compressor:
+    enabled: true
+    model: null
+    min_branch_chars: 1000
+    max_branch_summary_chars: 1200
+    include_negative_findings: true
+    preserve_failed_branch_details: false
+```
+
+`preserve_failed_branch_details: false` does not delete stored history. It only
+omits raw failed-branch details from the active model prompt and keeps a short
+summary such as "Tried X; failed because Y; do not retry unless Z changes."
+
 Plugin engines are **never auto-activated** — you must explicitly set `context.engine` to the plugin name. Available engines can be browsed and selected via `hermes plugins` → Provider Plugins → Context Engine.
 
 See [Memory Providers](/user-guide/features/memory-providers) for the analogous single-select system for memory plugins.
