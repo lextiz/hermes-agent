@@ -817,8 +817,9 @@ into attempt branches before summarization. Branches that produced facts, code,
 files, commands, or decisions are summarized separately. Failed branches are
 preserved as short negative findings so the model remembers what not to retry
 without carrying raw failed logs in active context. If the planner returns
-invalid JSON, Hermes falls back to a single `unknown` branch instead of making
-semantic guesses.
+invalid JSON, Hermes asks it to repair the JSON in the same short conversation.
+Each detected branch is summarized by its own auxiliary LLM call. If planner or
+branch-summary repair still fails, Hermes falls back to the default compressor.
 
 ```yaml
 context:
@@ -827,7 +828,15 @@ context:
     enabled: true
     model: null
     planner_model: null
-    planner_max_tokens: 8000
+    planner_max_tokens: 12000
+    planner_repair_attempts: 2
+    planner_group_max_chars: 700
+    branch_summary_max_tokens: 4000
+    branch_summary_repair_attempts: 1
+    branch_source_max_chars: 6000
+    llm_timeout: 300
+    llm_call_retries: 3
+    llm_retry_delay_seconds: 5
     min_branch_chars: 1000
     max_branch_summary_chars: 1200
     include_negative_findings: true
