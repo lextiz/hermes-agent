@@ -407,6 +407,29 @@ compression:
   # auxiliary section below (auxiliary.compression.provider / model).
 
 # =============================================================================
+# Context Engine (Advanced)
+# =============================================================================
+# The default context engine is the built-in lossy compressor above. Alternative
+# engines are never auto-activated; opt in by setting context.engine.
+#
+context:
+  engine: "compressor"
+
+  # Experimental branch-aware compressor. Enable by setting:
+  #   context.engine: "branch_compressor"
+  #
+  # It preserves the normal protected head and recent tail, but groups the
+  # compacted middle into attempt branches. Failed attempts are kept as short
+  # negative findings instead of raw failed-branch logs.
+  branch_compressor:
+    enabled: true
+    model: null
+    min_branch_chars: 1000
+    max_branch_summary_chars: 1200
+    include_negative_findings: true
+    preserve_failed_branch_details: false
+
+# =============================================================================
 # Anthropic prompt caching TTL
 # =============================================================================
 # When prompt caching is active (Claude via OpenRouter or native Anthropic),

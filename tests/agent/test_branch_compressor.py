@@ -6,7 +6,6 @@ from plugins.context_engine import load_context_engine
 from plugins.context_engine.branch_compressor import (
     BranchAwareContextCompressor,
     _CONTRIBUTING,
-    _FAILED,
     _IRRELEVANT,
 )
 
