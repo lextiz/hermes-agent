@@ -1,3 +1,4 @@
+import json
 from unittest.mock import patch
 
 from agent.context_compressor import ContextCompressor, SUMMARY_PREFIX
@@ -6,6 +7,7 @@ from plugins.context_engine import load_context_engine
 from plugins.context_engine.branch_compressor import (
     BranchAwareContextCompressor,
     _CONTRIBUTING,
+    _FAILED,
     _IRRELEVANT,
 )
 
@@ -90,6 +92,35 @@ def _assert_valid_tool_pairs(messages):
     assert call_ids <= result_ids
 
 
+def _planner_json():
+    return json.dumps({
+        "branches": [
+            {
+                "group_indices": [1, 2, 3, 4],
+                "classification": _FAILED,
+                "title": "dependency alpha attempt",
+                "key_points": ["Checked dependency alpha."],
+                "negative_findings": [
+                    "Tried dependency alpha resolution; failed because dependency alpha was missing; do not retry unless dependency alpha is installed."
+                ],
+                "omitted_reason": "",
+            },
+            {
+                "group_indices": [5, 6, 7, 8, 9],
+                "classification": _CONTRIBUTING,
+                "title": "beta config fix",
+                "key_points": ["Updated agent/beta.py and pytest tests/beta passed."],
+                "negative_findings": [],
+                "omitted_reason": "",
+            },
+        ]
+    })
+
+
+def _install_llm_planner(engine):
+    engine._call_branch_plan_model = lambda prompt: _planner_json()
+
+
 def test_engine_can_be_selected_by_context_engine_loader():
     engine = load_context_engine("branch_compressor")
     assert isinstance(engine, BranchAwareContextCompressor)
@@ -104,6 +135,7 @@ def test_default_compressor_remains_the_default_engine_class():
 
 def test_segmentation_keeps_tool_call_and_result_together():
     engine = _engine()
+    _install_llm_planner(engine)
     messages = _conversation()[3:11]
 
     branches = engine._segment_attempt_branches(messages)
@@ -118,6 +150,7 @@ def test_segmentation_keeps_tool_call_and_result_together():
 
 def test_compress_preserves_head_tail_and_latest_user_verbatim():
     engine = _engine()
+    _install_llm_planner(engine)
     engine._call_branch_summary_model = lambda prompt, budget: None
     messages = _conversation()
 
@@ -132,6 +165,7 @@ def test_compress_preserves_head_tail_and_latest_user_verbatim():
 
 def test_failed_branch_raw_details_omitted_but_negative_finding_remains():
     engine = _engine()
+    _install_llm_planner(engine)
     engine._call_branch_summary_model = lambda prompt, budget: None
 
     compressed = engine.compress(_conversation(), current_tokens=90000)
@@ -145,7 +179,7 @@ def test_failed_branch_raw_details_omitted_but_negative_finding_remains():
 
 def test_contributing_and_irrelevant_branches_are_structured_separately():
     engine = _engine()
-    branches = engine._segment_attempt_branches([
+    groups = engine._build_atomic_groups([
         {"role": "user", "content": "Repeated log inspection with no new findings. " + ("x" * 220)},
         {"role": "assistant", "content": "No new findings; duplicate output."},
         {"role": "user", "content": "Implement useful beta fix. " + ("y" * 260)},
@@ -156,8 +190,26 @@ def test_contributing_and_irrelevant_branches_are_structured_separately():
         },
         {"role": "tool", "tool_call_id": "call-c", "content": "exit 0\n3 passed"},
     ])
-    for branch in branches:
-        engine._classify_branch(branch)
+    branches = engine._parse_branch_plan(json.dumps({
+        "branches": [
+            {
+                "group_indices": [1, 2],
+                "classification": _IRRELEVANT,
+                "title": "repeated log inspection",
+                "key_points": [],
+                "negative_findings": [],
+                "omitted_reason": "Repeated inspection produced no new durable findings.",
+            },
+            {
+                "group_indices": [3, 4],
+                "classification": _CONTRIBUTING,
+                "title": "beta fix",
+                "key_points": ["Updated agent/beta.py and pytest passed."],
+                "negative_findings": [],
+                "omitted_reason": "",
+            },
+        ]
+    }), groups)
 
     summary = engine._fallback_branch_summary(branches)
 
@@ -169,6 +221,7 @@ def test_contributing_and_irrelevant_branches_are_structured_separately():
 
 def test_bad_summarizer_output_falls_back_safely():
     engine = _engine()
+    _install_llm_planner(engine)
     engine._call_branch_summary_model = lambda prompt, budget: "not valid"
 
     compressed = engine.compress(_conversation(), current_tokens=90000)
@@ -181,6 +234,7 @@ def test_bad_summarizer_output_falls_back_safely():
 
 def test_provider_valid_message_sequence_after_compression():
     engine = _engine()
+    _install_llm_planner(engine)
     engine._call_branch_summary_model = lambda prompt, budget: None
 
     compressed = engine.compress(_conversation(), current_tokens=90000)
@@ -190,6 +244,7 @@ def test_provider_valid_message_sequence_after_compression():
 
 def test_token_budget_improves_compared_with_uncompressed_middle():
     engine = _engine()
+    _install_llm_planner(engine)
     engine._call_branch_summary_model = lambda prompt, budget: None
     messages = _conversation()
 
@@ -208,6 +263,10 @@ def test_configure_applies_branch_compressor_settings():
             "include_negative_findings": False,
             "preserve_failed_branch_details": True,
             "model": "summary/model",
+            "planner_model": "planner/model",
+            "planner_max_tokens": 1234,
+            "telemetry_enabled": False,
+            "log_branch_details": True,
         },
         compression_config={"protect_first_n": 0, "protect_last_n": 4},
         quiet_mode=False,
@@ -219,6 +278,10 @@ def test_configure_applies_branch_compressor_settings():
     assert engine.include_negative_findings is False
     assert engine.preserve_failed_branch_details is True
     assert engine.summary_model == "summary/model"
+    assert engine.planner_model == "planner/model"
+    assert engine.planner_max_tokens == 1234
+    assert engine.telemetry_enabled is False
+    assert engine.log_branch_details is True
     assert engine.protect_first_n == 0
     assert engine.protect_last_n == 4
     assert engine.quiet_mode is False
@@ -226,6 +289,7 @@ def test_configure_applies_branch_compressor_settings():
 
 def test_branch_summary_uses_existing_reference_prefix():
     engine = _engine()
+    _install_llm_planner(engine)
     engine._call_branch_summary_model = lambda prompt, budget: None
 
     compressed = engine.compress(_conversation(), current_tokens=90000)
@@ -233,3 +297,32 @@ def test_branch_summary_uses_existing_reference_prefix():
 
     assert SUMMARY_PREFIX in text
     assert "[Branch-aware conversation compression summary]" in text
+
+
+def test_bad_planner_output_falls_back_to_unknown_without_semantic_guessing():
+    engine = _engine()
+    engine._call_branch_plan_model = lambda prompt: "not json"
+    engine._call_branch_summary_model = lambda prompt, budget: None
+
+    compressed = engine.compress(_conversation(), current_tokens=90000)
+    text = _summary_text(compressed)
+
+    assert "Unknown Branches" in text
+    assert "Branch planning was unavailable" in text
+    assert "STACKTRACE_UNIQUE_RAW_DETAIL" not in text
+    assert engine.get_status()["branch_compressor_telemetry"]["planner_fallback_used"] is True
+
+
+def test_telemetry_records_branch_counts():
+    engine = _engine()
+    _install_llm_planner(engine)
+    engine._call_branch_summary_model = lambda prompt, budget: None
+
+    engine.compress(_conversation(), current_tokens=90000)
+    telemetry = engine.get_status()["branch_compressor_telemetry"]
+
+    assert telemetry["branches_total"] >= 2
+    assert telemetry["classification_counts"][_FAILED] >= 1
+    assert telemetry["classification_counts"][_CONTRIBUTING] >= 1
+    assert telemetry["atomic_groups"] > 0
+    assert telemetry["duration_ms"] >= 0

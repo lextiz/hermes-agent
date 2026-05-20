@@ -812,11 +812,13 @@ context:
 
 `branch_compressor` is an opt-in experimental engine for long exploratory agent
 sessions. It keeps the default compressor's protected system/head context and
-recent tail behavior, but groups the compacted middle into attempt branches
-before summarization. Branches that produced facts, code, files, commands, or
-decisions are summarized separately. Failed branches are preserved as short
-negative findings so the model remembers what not to retry without carrying raw
-failed logs in active context.
+recent tail behavior, but asks an auxiliary LLM to group the compacted middle
+into attempt branches before summarization. Branches that produced facts, code,
+files, commands, or decisions are summarized separately. Failed branches are
+preserved as short negative findings so the model remembers what not to retry
+without carrying raw failed logs in active context. If the planner returns
+invalid JSON, Hermes falls back to a single `unknown` branch instead of making
+semantic guesses.
 
 ```yaml
 context:
@@ -824,10 +826,14 @@ context:
   branch_compressor:
     enabled: true
     model: null
+    planner_model: null
+    planner_max_tokens: 3000
     min_branch_chars: 1000
     max_branch_summary_chars: 1200
     include_negative_findings: true
     preserve_failed_branch_details: false
+    telemetry_enabled: true
+    log_branch_details: false
 ```
 
 `preserve_failed_branch_details: false` does not delete stored history. It only
