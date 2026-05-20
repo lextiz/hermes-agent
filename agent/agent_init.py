@@ -1521,6 +1521,20 @@ def init_agent(
 
     if _selected_engine is not None:
         agent.context_compressor = _selected_engine
+        if hasattr(agent.context_compressor, "configure"):
+            try:
+                _engine_cfg = _ctx_cfg.get(_engine_name, {})
+                agent.context_compressor.configure(
+                    _engine_cfg if isinstance(_engine_cfg, dict) else {},
+                    compression_config=_compression_cfg,
+                    quiet_mode=agent.quiet_mode,
+                )
+            except Exception as _ce_cfg_err:
+                _ra().logger.warning(
+                    "Context engine '%s' configuration failed: %s",
+                    _engine_name,
+                    _ce_cfg_err,
+                )
         # Resolve context_length for plugin engines — mirrors switch_model() path
         from agent.model_metadata import get_model_context_length
         _plugin_ctx_len = get_model_context_length(

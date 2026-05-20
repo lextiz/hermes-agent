@@ -1,0 +1,4 @@
+name: branch_compressor
+description: Experimental branch-aware context compressor that groups compacted middle turns into attempt branches and preserves negative findings without raw failed-branch detail.
+version: 0.1.0
+experimental: true
