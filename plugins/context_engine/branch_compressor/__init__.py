@@ -464,23 +464,13 @@ Use the real complete range 1-{len(groups)} if you choose that fallback."""
         if time.monotonic() < self._summary_failure_cooldown_until:
             return None
 
-        plan_messages = messages if isinstance(messages, list) else [{"role": "user", "content": str(messages)}]
+        plan_messages = self._as_chat_messages(messages)
         try:
-            call_kwargs = {
-                "task": "compression",
-                "main_runtime": {
-                    "model": self.model,
-                    "provider": self.provider,
-                    "base_url": self.base_url,
-                    "api_key": self.api_key,
-                    "api_mode": self.api_mode,
-                },
-                "messages": plan_messages,
-                "max_tokens": self.planner_max_tokens,
-                "timeout": self.llm_timeout,
-            }
-            if self.planner_model:
-                call_kwargs["model"] = self.planner_model
+            call_kwargs = self._build_llm_call_kwargs(
+                plan_messages,
+                self.planner_max_tokens,
+                self.planner_model,
+            )
             response = self._call_auxiliary_llm_with_retries(call_kwargs, "planning")
             content = response.choices[0].message.content
             return content if isinstance(content, str) else str(content or "")
@@ -696,18 +686,6 @@ Use the real complete range 1-{len(groups)} if you choose that fallback."""
             return [value.strip()[:500]]
         return []
 
-    def _fallback_branch_plan(self, groups: List[Dict[str, Any]]) -> List[AttemptBranch]:
-        return [self._branch_from_groups(
-            {
-                "classification": _UNKNOWN,
-                "title": "Unclassified compacted middle",
-                "key_points": ["Branch planning was unavailable; preserve conservatively."],
-            },
-            1,
-            [group["index"] for group in groups],
-            {group["index"]: group for group in groups},
-        )]
-
     # ------------------------------------------------------------------
     # Per-branch LLM summaries and final deterministic composition
     # ------------------------------------------------------------------
@@ -835,23 +813,9 @@ If uncertain, keep the planner title/classification and write one conservative k
         if now < self._summary_failure_cooldown_until:
             return None
 
-        summary_messages = messages if isinstance(messages, list) else [{"role": "user", "content": str(messages)}]
+        summary_messages = self._as_chat_messages(messages)
         try:
-            call_kwargs = {
-                "task": "compression",
-                "main_runtime": {
-                    "model": self.model,
-                    "provider": self.provider,
-                    "base_url": self.base_url,
-                    "api_key": self.api_key,
-                    "api_mode": self.api_mode,
-                },
-                "messages": summary_messages,
-                "max_tokens": max_tokens,
-                "timeout": self.llm_timeout,
-            }
-            if self.summary_model:
-                call_kwargs["model"] = self.summary_model
+            call_kwargs = self._build_llm_call_kwargs(summary_messages, max_tokens, self.summary_model)
             response = self._call_auxiliary_llm_with_retries(call_kwargs, "branch summary")
             content = response.choices[0].message.content
             return content if isinstance(content, str) else str(content or "")
@@ -1032,6 +996,35 @@ The latest user message is preserved verbatim after this summary and should be t
         if last_exc:
             raise last_exc
         raise RuntimeError(f"Branch-aware compression {label} call failed")
+
+    def _build_llm_call_kwargs(
+        self,
+        messages: List[Dict[str, Any]],
+        max_tokens: int,
+        model_override: str = "",
+    ) -> Dict[str, Any]:
+        call_kwargs = {
+            "task": "compression",
+            "main_runtime": {
+                "model": self.model,
+                "provider": self.provider,
+                "base_url": self.base_url,
+                "api_key": self.api_key,
+                "api_mode": self.api_mode,
+            },
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "timeout": self.llm_timeout,
+        }
+        if model_override:
+            call_kwargs["model"] = model_override
+        return call_kwargs
+
+    @staticmethod
+    def _as_chat_messages(messages: Any) -> List[Dict[str, Any]]:
+        if isinstance(messages, list):
+            return messages
+        return [{"role": "user", "content": str(messages)}]
 
     @staticmethod
     def _is_retryable_llm_error(exc: Exception) -> bool:
