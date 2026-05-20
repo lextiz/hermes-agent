@@ -92,7 +92,7 @@ class BranchAwareContextCompressor(ContextCompressor):
         self.include_negative_findings = True
         self.preserve_failed_branch_details = False
         self.planner_model = ""
-        self.planner_max_tokens = 3000
+        self.planner_max_tokens = 8000
         self.telemetry_enabled = True
         self.log_branch_details = False
         self._last_branch_telemetry: Dict[str, Any] = {}
@@ -140,7 +140,7 @@ class BranchAwareContextCompressor(ContextCompressor):
         planner_model = cfg.get("planner_model")
         if planner_model:
             self.planner_model = str(planner_model)
-        self.planner_max_tokens = _as_int(cfg.get("planner_max_tokens"), 3000, 500)
+        self.planner_max_tokens = _as_int(cfg.get("planner_max_tokens"), 8000, 500)
         self.telemetry_enabled = _boolish(cfg.get("telemetry_enabled"), True)
         self.log_branch_details = _boolish(cfg.get("log_branch_details"), False)
 

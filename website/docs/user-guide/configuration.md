@@ -827,7 +827,7 @@ context:
     enabled: true
     model: null
     planner_model: null
-    planner_max_tokens: 3000
+    planner_max_tokens: 8000
     min_branch_chars: 1000
     max_branch_summary_chars: 1200
     include_negative_findings: true
