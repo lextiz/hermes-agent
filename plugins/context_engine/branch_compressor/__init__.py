@@ -173,6 +173,31 @@ class BranchAwareContextCompressor(ContextCompressor):
         self._last_summary_error = None
         return self._with_summary_prefix(summary_body)
 
+    def _ensure_last_user_message_in_tail(
+        self,
+        messages: List[Dict[str, Any]],
+        cut_idx: int,
+        head_end: int,
+    ) -> int:
+        """Avoid making the latest user message the first tail message.
+
+        The inherited compressor can merge the summary into the first tail
+        message to avoid role collisions. This engine promises the latest user
+        message stays exact, so keep one earlier tail message ahead of it when
+        there is a clean boundary available.
+        """
+        cut_idx = super()._ensure_last_user_message_in_tail(messages, cut_idx, head_end)
+        last_user_idx = self._find_last_user_message_idx(messages, head_end)
+        if last_user_idx < 0 or cut_idx != last_user_idx:
+            return cut_idx
+        if last_user_idx <= head_end + 1:
+            return cut_idx
+
+        candidate = self._align_boundary_backward(messages, last_user_idx)
+        if candidate < last_user_idx:
+            return max(candidate, head_end + 1)
+        return max(last_user_idx - 1, head_end + 1)
+
     # ------------------------------------------------------------------
     # Segmentation
     # ------------------------------------------------------------------
